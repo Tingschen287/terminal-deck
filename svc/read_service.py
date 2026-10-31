@@ -12,12 +12,16 @@ import socket
 import socketserver
 import subprocess
 import sys
+import threading
 from typing import Any
 
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_EVENT_PAGE = 500
 MAX_TEXT_BYTES = 5 * 1024 * 1024
+CONNECTION_READ_TIMEOUT = 5.0
+MAX_CONCURRENT_CONNECTIONS = 16
+LISTEN_BACKLOG = 64
 
 
 class ReadServiceError(RuntimeError):
@@ -107,6 +111,10 @@ class ProjectCtlClient:
 
 
 class ReadRequestHandler(socketserver.StreamRequestHandler):
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(self.server.connection_read_timeout)
+
     def handle(self) -> None:
         try:
             raw = self.rfile.readline(MAX_REQUEST_BYTES + 1)
@@ -119,19 +127,59 @@ class ReadRequestHandler(socketserver.StreamRequestHandler):
             if not isinstance(request, dict):
                 raise ReadServiceError("request must be a JSON object")
             response = self.server.dispatch(request)
+        except socket.timeout:
+            response = {"ok": False, "error": "request read timed out"}
         except ReadServiceError as exc:
             response = {"ok": False, "error": str(exc)}
         except Exception:
             response = {"ok": False, "error": "internal read service error"}
-        self.wfile.write(json.dumps(response, ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\n")
+        try:
+            self.wfile.write(
+                json.dumps(response, ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\n"
+            )
+        except OSError:
+            pass
 
 
 class ReadServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
+    request_queue_size = LISTEN_BACKLOG
 
-    def __init__(self, socket_path: str, client: ProjectCtlClient) -> None:
+    def __init__(
+        self,
+        socket_path: str,
+        client: ProjectCtlClient,
+        *,
+        max_connections: int = MAX_CONCURRENT_CONNECTIONS,
+        connection_read_timeout: float = CONNECTION_READ_TIMEOUT,
+    ) -> None:
+        if max_connections < 1 or connection_read_timeout <= 0:
+            raise ReadServiceError("connection limits must be positive")
         self.client = client
+        self.connection_read_timeout = connection_read_timeout
+        self._connection_slots = threading.BoundedSemaphore(max_connections)
         super().__init__(socket_path, ReadRequestHandler)
+
+    def process_request(self, request: socket.socket, client_address: Any) -> None:
+        if not self._connection_slots.acquire(blocking=False):
+            try:
+                request.sendall(b'{"ok":false,"error":"server connection limit reached"}\n')
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_slots.release()
 
     def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         if request.get("op") == "health":
@@ -156,8 +204,6 @@ def serve(socket_path: str, projectctl: str) -> int:
         os.chmod(path, 0o600)
 
         def stop(_signum: int, _frame: Any) -> None:
-            import threading
-
             threading.Thread(target=server.shutdown, daemon=True).start()
 
         signal.signal(signal.SIGTERM, stop)

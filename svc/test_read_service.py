@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import socket
 import stat
 import tempfile
 import threading
+import time
 import unittest
 
 from read_service import ProjectCtlClient, ReadServer, ReadServiceError
@@ -104,6 +106,43 @@ print(json.dumps({'ok': True, 'result': {'argv': sys.argv[1:]}}))
         for request in requests:
             self.assertFalse(self.request(request)["ok"])
         self.assertEqual(self.calls(), [])
+
+    def test_burst_connections_have_bounded_workers_and_large_backlog(self) -> None:
+        self.assertGreaterEqual(self.server.request_queue_size, 32)
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            responses = list(executor.map(lambda _: self.request({"op": "health"}), range(32)))
+        self.assertTrue(all(response["ok"] for response in responses))
+        self.assertEqual(self.calls(), [])
+
+    def test_slow_connection_times_out_and_releases_capacity(self) -> None:
+        socket_path = self.root / "limited.sock"
+        server = ReadServer(
+            str(socket_path), self.client, max_connections=1, connection_read_timeout=0.2
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        slow = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            slow.settimeout(2)
+            slow.connect(str(socket_path))
+            slow.sendall(b'{"op":"he')
+            time.sleep(0.05)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as extra:
+                extra.settimeout(2)
+                extra.connect(str(socket_path))
+                extra.sendall(b'{"op":"health"}\n')
+                busy = json.loads(extra.makefile("rb").readline())
+            self.assertFalse(busy["ok"])
+            self.assertIn("connection limit", busy["error"])
+            timeout = json.loads(slow.makefile("rb").readline())
+            self.assertEqual(timeout, {"ok": False, "error": "request read timed out"})
+            healthy = self.request({"op": "health"})
+            self.assertTrue(healthy["ok"])
+        finally:
+            slow.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_missing_projectctl_fails_before_start(self) -> None:
         with self.assertRaises(ReadServiceError):

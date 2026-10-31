@@ -45,6 +45,10 @@ python3.12 svc/read_service.py health --socket /tmp/anpai-read-$UID.sock
 `graph` 与 `event_cursor` 元数据。错误返回 `{"ok":false,"error":"..."}`，不会把
 读不到的数据源伪装为空结果。
 
+每个连接的请求读取超时为 5 秒，最多同时处理 16 个连接，监听队列容量为 64。
+容量占满时新连接收到明确的 `server connection limit reached` 错误；慢连接超时后
+释放处理名额，不会无限占用线程。
+
 ## 测试
 
 ```bash
