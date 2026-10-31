@@ -5,10 +5,11 @@
 `0600`，只把四类只读请求转发给 projectctl 的 `read-project`、`read-node`、
 `read-events`、`read-file`。服务不读取凭据、不联网，也没有项目写入操作。
 
-**socket 上不传任何文件正文。** 证据、评审报告、loop 日志与事件的自由文本都不经本服务；
-响应只有元数据（路径、大小、sha256、mtime、所属事件与 attempt、评审结论与 blocker
-标题等结构化字段），事件是逐字段白名单投影、未知字段丢弃。原文由 GUI 用响应里的
-`project_root` 拼上相对路径在本机自己打开。细节见 projectctl README「不写盘的 JSON 读取」。
+**socket 上不传任何原文。** 文件正文与人写文本（事件原因、处置要求、评审 blocker、合同
+目标与验收标准等）都不经本服务：文件只有路径、大小、sha256、mtime 与账本引用；人写文本只有
+`{length, sha256, source, field}` 摘要；其余字段是格式受控的标识或枚举，映射按固定键白名单
+输出、未知键丢弃。原文由 GUI 用响应里的 `project_root` 拼上 `source` 在本机自己打开。细节见
+projectctl README「不写盘的 JSON 读取」。
 
 需要 Python 3.11+（当前 projectctl 的语法要求；本机使用 `python3.12`）和 PyYAML。
 
@@ -47,11 +48,17 @@ python3.12 svc/read_service.py health --socket /tmp/anpai-read-$UID.sock
 ```
 
 增量事件读取使用上一次响应的 `result.page.next_cursor`。响应保留 projectctl 的
-`graph` 与 `event_cursor` 元数据。错误返回 `{"ok":false,"error":"..."}`，不会把
-读不到的数据源伪装为空结果。
+`graph` 与 `event_cursor` 元数据。读不到的数据源不会伪装为空结果。
+
+错误响应固定为 `{"ok":false,"error":"<错误码>","message":"<固定说明>"}`，不含任何请求内容、
+projectctl 输出或异常文本；原始细节只写服务本机 stderr。服务自身的错误码：`request_invalid`、
+`request_timeout`、`capacity_reached`、`unsupported_operation`、`argument_invalid`、
+`projectctl_unavailable`、`projectctl_timeout`、`projectctl_invalid_response`、
+`projectctl_failed`、`internal_error`；projectctl 的读取错误码（`node_not_found`、
+`path_outside_project`、`history_invalid` 等）原样转发错误码，未知的一律 `projectctl_failed`。
 
 每个连接的请求读取超时为 5 秒，最多同时处理 16 个连接，监听队列容量为 64。
-容量占满时新连接收到明确的 `server connection limit reached` 错误；慢连接超时后
+容量占满时新连接收到 `capacity_reached` 错误；慢连接超时后
 释放处理名额，不会无限占用线程。容量拒绝在 accept 时立即回一行错误再关闭连接，
 客户端应先读响应；连上后先写请求可能遇到对端已关闭（`BrokenPipeError`）。
 
