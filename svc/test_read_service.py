@@ -31,6 +31,13 @@ with log.open('a', encoding='utf-8') as handle:
 if 'read-file' in sys.argv and 'bad' in sys.argv:
     print(json.dumps({'ok': False, 'error': 'synthetic read failure'}))
     raise SystemExit(1)
+if 'read-file' in sys.argv and 'coded' in sys.argv:
+    print('raw detail SYNTH_SECRET_9f3a', file=sys.stderr)
+    print(json.dumps({'ok': False, 'error': 'node_not_found: leaked SYNTH_SECRET_9f3a'}))
+    raise SystemExit(1)
+if 'read-file' in sys.argv and 'uncoded' in sys.argv:
+    print(json.dumps({'ok': False, 'error': 'SYNTH_SECRET_9f3a: not a code we know'}))
+    raise SystemExit(1)
 print(json.dumps({'ok': True, 'result': {'argv': sys.argv[1:]}}))
 """
             % str(self.log),
@@ -88,13 +95,40 @@ print(json.dumps({'ok': True, 'result': {'argv': sys.argv[1:]}}))
     def test_write_and_unknown_operations_are_rejected_without_calling_projectctl(self) -> None:
         for operation in ("start", "submit", "review", "write", "text", "amend", None):
             response = self.request({"op": operation, "project": "/synthetic/project"})
-            self.assertFalse(response["ok"])
-            self.assertIn("unsupported read operation", response["error"])
+            self.assertEqual(
+                response,
+                {"ok": False, "error": "unsupported_operation", "message": "unsupported read operation"},
+            )
         self.assertEqual(self.calls(), [])
 
     def test_projectctl_error_is_returned_clearly(self) -> None:
         response = self.request({"op": "file", "project": "/synthetic/project", "path": "bad"})
-        self.assertEqual(response, {"ok": False, "error": "synthetic read failure"})
+        self.assertEqual(
+            response, {"ok": False, "error": "projectctl_failed", "message": "projectctl read failed"}
+        )
+
+    def test_errors_carry_only_fixed_codes_never_input_or_projectctl_text(self) -> None:
+        marker = "SYNTH_SECRET_9f3a"
+        coded = self.request({"op": "file", "project": "/synthetic/project", "path": "coded"})
+        self.assertEqual(coded["error"], "node_not_found")
+        uncoded = self.request({"op": "file", "project": "/synthetic/project", "path": "uncoded"})
+        self.assertEqual(uncoded["error"], "projectctl_failed")
+        responses = [coded, uncoded]
+        for request in (
+            {"op": marker, "project": marker},
+            {"op": "node", "project": marker, "node_id": 7},
+            {"op": "events", "project": marker, "limit": marker},
+        ):
+            responses.append(self.request(request))
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(5)
+            connection.connect(str(self.socket_path))
+            connection.sendall(b"{not json " + marker.encode() + b"\n")
+            responses.append(json.loads(connection.makefile("rb").readline()))
+        for response in responses:
+            self.assertFalse(response["ok"])
+            self.assertEqual(set(response), {"ok", "error", "message"})
+            self.assertNotIn(marker, json.dumps(response))
 
     def test_invalid_limits_and_cursor_combination_are_rejected(self) -> None:
         requests = [
@@ -135,9 +169,11 @@ print(json.dumps({'ok': True, 'result': {'argv': sys.argv[1:]}}))
                 extra.connect(str(socket_path))
                 busy = json.loads(extra.makefile("rb").readline())
             self.assertFalse(busy["ok"])
-            self.assertIn("connection limit", busy["error"])
+            self.assertEqual(busy["error"], "capacity_reached")
             timeout = json.loads(slow.makefile("rb").readline())
-            self.assertEqual(timeout, {"ok": False, "error": "request read timed out"})
+            self.assertEqual(
+                timeout, {"ok": False, "error": "request_timeout", "message": "request read timed out"}
+            )
             healthy = self.request({"op": "health"})
             self.assertTrue(healthy["ok"])
         finally:

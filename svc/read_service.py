@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -27,8 +28,47 @@ MAX_CONCURRENT_CONNECTIONS = 16
 LISTEN_BACKLOG = 64
 
 
+# 所有错误响应都是 {"ok": false, "error": <固定错误码>, "message": <固定说明>}，
+# 不拼入任何请求内容、projectctl 输出或异常文本；原始细节只写本机 stderr。
+SERVICE_ERROR_MESSAGES = {
+    "request_invalid": "request must be one JSON object line of at most 65536 bytes",
+    "request_timeout": "request read timed out",
+    "capacity_reached": "server connection limit reached",
+    "unsupported_operation": "unsupported read operation",
+    "argument_invalid": "request arguments are invalid",
+    "projectctl_unavailable": "projectctl could not be started",
+    "projectctl_timeout": "projectctl read timed out",
+    "projectctl_invalid_response": "projectctl returned an invalid response",
+    "projectctl_failed": "projectctl read failed",
+    "internal_error": "internal read service error",
+}
+# projectctl 读取命令的固定错误码（见 projectctl READ_ERROR_MESSAGES）；svc 只转发错误码。
+PROJECTCTL_READ_ERROR_CODES = frozenset(
+    {
+        "project_unresolved", "graph_unreadable", "graph_invalid", "graph_changed_retry",
+        "ledger_unreadable", "ledger_invalid", "ledger_chain_invalid", "history_invalid",
+        "readme_unreadable", "frontmatter_invalid", "node_not_found", "cursor_not_found",
+        "argument_invalid", "path_outside_project", "file_not_found", "file_unreadable",
+        "file_too_large", "record_invalid", "read_failed",
+    }
+)
+ERROR_CODE_PREFIX_RE = re.compile(r"([a-z_]{1,40}):")
+
+
 class ReadServiceError(RuntimeError):
-    pass
+    def __init__(self, code: str, message: str | None = None) -> None:
+        if code not in SERVICE_ERROR_MESSAGES and code not in PROJECTCTL_READ_ERROR_CODES:
+            code = "internal_error"
+        self.code = code
+        self.message = message or SERVICE_ERROR_MESSAGES.get(code, "projectctl read failed: " + code)
+        super().__init__(f"{self.code}: {self.message}")
+
+    def response(self) -> dict[str, Any]:
+        return {"ok": False, "error": self.code, "message": self.message}
+
+
+def log_detail(code: str, detail: object) -> None:
+    print(f"read service detail ({code}): {detail}", file=sys.stderr)
 
 
 class ProjectCtlClient:
@@ -36,13 +76,13 @@ class ProjectCtlClient:
         self.executable = os.path.abspath(executable)
         self.timeout = timeout
         if not os.path.isfile(self.executable):
-            raise ReadServiceError("projectctl executable is not a file")
+            raise ReadServiceError("projectctl_unavailable")
 
     def call(self, request: dict[str, Any]) -> dict[str, Any]:
         operation = request.get("op")
         project = request.get("project")
         if not isinstance(project, str) or not project:
-            raise ReadServiceError("project must be a non-empty string")
+            raise ReadServiceError("argument_invalid")
         arguments = [
             sys.executable,
             self.executable,
@@ -56,32 +96,32 @@ class ProjectCtlClient:
         elif operation == "node":
             node_id = request.get("node_id")
             if not isinstance(node_id, str) or not node_id:
-                raise ReadServiceError("node_id must be a non-empty string")
+                raise ReadServiceError("argument_invalid")
             arguments.extend(["read-node", node_id])
         elif operation == "events":
             arguments.append("read-events")
             limit = request.get("limit", 50)
             if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_EVENT_PAGE:
-                raise ReadServiceError("limit must be an integer between 1 and 500")
+                raise ReadServiceError("argument_invalid")
             arguments.extend(["--limit", str(limit)])
             cursor = request.get("cursor")
             before = request.get("before")
             if cursor is not None and before is not None:
-                raise ReadServiceError("cursor and before are mutually exclusive")
+                raise ReadServiceError("argument_invalid")
             for name, value in (("cursor", cursor), ("before", before)):
                 if value is not None:
                     if not isinstance(value, str) or not value:
-                        raise ReadServiceError(name + " must be a non-empty string")
+                        raise ReadServiceError("argument_invalid")
                     arguments.extend(["--" + name, value])
         elif operation == "file":
             # 只取元数据（大小、sha256、mtime、账本引用）；正文不经 socket，
             # GUI 用响应里的 project_root 与 path 在本机自己打开。
             path = request.get("path")
             if not isinstance(path, str) or not path:
-                raise ReadServiceError("path must be a non-empty string")
+                raise ReadServiceError("argument_invalid")
             arguments.extend(["read-file", path])
         else:
-            raise ReadServiceError("unsupported read operation")
+            raise ReadServiceError("unsupported_operation")
         try:
             completed = subprocess.run(
                 arguments,
@@ -93,18 +133,24 @@ class ProjectCtlClient:
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            raise ReadServiceError("projectctl read timed out") from exc
+            log_detail("projectctl_timeout", exc)
+            raise ReadServiceError("projectctl_timeout") from exc
         except OSError as exc:
-            raise ReadServiceError("cannot start projectctl: " + str(exc)) from exc
+            log_detail("projectctl_unavailable", exc)
+            raise ReadServiceError("projectctl_unavailable") from exc
+        if completed.stderr:
+            log_detail("projectctl_stderr", completed.stderr.strip())
         try:
             response = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
-            raise ReadServiceError("projectctl returned invalid JSON") from exc
+            raise ReadServiceError("projectctl_invalid_response") from exc
         if not isinstance(response, dict) or "ok" not in response:
-            raise ReadServiceError("projectctl returned an invalid response")
+            raise ReadServiceError("projectctl_invalid_response")
         if completed.returncode != 0 or not response.get("ok"):
-            error = response.get("error", "projectctl read failed")
-            raise ReadServiceError(str(error)[:2000])
+            error = response.get("error")
+            match = ERROR_CODE_PREFIX_RE.match(error) if isinstance(error, str) else None
+            code = match.group(1) if match else ""
+            raise ReadServiceError(code if code in PROJECTCTL_READ_ERROR_CODES else "projectctl_failed")
         return response
 
 
@@ -117,20 +163,21 @@ class ReadRequestHandler(socketserver.StreamRequestHandler):
         try:
             raw = self.rfile.readline(MAX_REQUEST_BYTES + 1)
             if not raw or len(raw) > MAX_REQUEST_BYTES or not raw.endswith(b"\n"):
-                raise ReadServiceError("request must be one JSON line of at most 65536 bytes")
+                raise ReadServiceError("request_invalid")
             try:
                 request = json.loads(raw)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ReadServiceError("request is not valid JSON") from exc
+                raise ReadServiceError("request_invalid") from exc
             if not isinstance(request, dict):
-                raise ReadServiceError("request must be a JSON object")
+                raise ReadServiceError("request_invalid")
             response = self.server.dispatch(request)
         except socket.timeout:
-            response = {"ok": False, "error": "request read timed out"}
+            response = ReadServiceError("request_timeout").response()
         except ReadServiceError as exc:
-            response = {"ok": False, "error": str(exc)}
-        except Exception:
-            response = {"ok": False, "error": "internal read service error"}
+            response = exc.response()
+        except Exception as exc:
+            log_detail("internal_error", repr(exc))
+            response = ReadServiceError("internal_error").response()
         try:
             self.wfile.write(
                 json.dumps(response, ensure_ascii=False, allow_nan=False).encode("utf-8") + b"\n"
@@ -152,7 +199,7 @@ class ReadServer(socketserver.ThreadingUnixStreamServer):
         connection_read_timeout: float = CONNECTION_READ_TIMEOUT,
     ) -> None:
         if max_connections < 1 or connection_read_timeout <= 0:
-            raise ReadServiceError("connection limits must be positive")
+            raise ValueError("connection limits must be positive")
         self.client = client
         self.connection_read_timeout = connection_read_timeout
         self._connection_slots = threading.BoundedSemaphore(max_connections)
@@ -161,7 +208,10 @@ class ReadServer(socketserver.ThreadingUnixStreamServer):
     def process_request(self, request: socket.socket, client_address: Any) -> None:
         if not self._connection_slots.acquire(blocking=False):
             try:
-                request.sendall(b'{"ok":false,"error":"server connection limit reached"}\n')
+                request.sendall(
+                    json.dumps(ReadServiceError("capacity_reached").response()).encode("utf-8")
+                    + b"\n"
+                )
             except OSError:
                 pass
             finally:
@@ -188,9 +238,9 @@ class ReadServer(socketserver.ThreadingUnixStreamServer):
 def serve(socket_path: str, projectctl: str) -> int:
     path = Path(socket_path).expanduser().absolute()
     if len(os.fsencode(path)) > 96:
-        raise ReadServiceError("socket path is too long; use a path of at most 96 bytes")
+        raise ReadServiceError("argument_invalid", "socket path is too long; use a path of at most 96 bytes")
     if path.exists() or path.is_symlink():
-        raise ReadServiceError("socket path already exists; refusing to replace it")
+        raise ReadServiceError("argument_invalid", "socket path already exists; refusing to replace it")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     client = ProjectCtlClient(projectctl)
     previous_umask = os.umask(0o177)
@@ -221,7 +271,7 @@ def health(socket_path: str) -> dict[str, Any]:
         response = connection.makefile("rb").readline(MAX_REQUEST_BYTES + 1)
     value = json.loads(response)
     if not isinstance(value, dict):
-        raise ReadServiceError("invalid health response")
+        raise ReadServiceError("internal_error", "invalid health response")
     return value
 
 
