@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Local-only project read service backed by projectctl read subcommands."""
+"""Local-only project read service backed by projectctl read subcommands.
+
+The service relays metadata-only JSON: no evidence, review, loop-log or event
+body text crosses the socket (projectctl returns whitelist projections only).
+"""
 
 from __future__ import annotations
 
@@ -18,7 +22,6 @@ from typing import Any
 
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_EVENT_PAGE = 500
-MAX_TEXT_BYTES = 5 * 1024 * 1024
 CONNECTION_READ_TIMEOUT = 5.0
 MAX_CONCURRENT_CONNECTIONS = 16
 LISTEN_BACKLOG = 64
@@ -70,18 +73,13 @@ class ProjectCtlClient:
                     if not isinstance(value, str) or not value:
                         raise ReadServiceError(name + " must be a non-empty string")
                     arguments.extend(["--" + name, value])
-        elif operation == "text":
+        elif operation == "file":
+            # 只取元数据（大小、sha256、mtime、账本引用）；正文不经 socket，
+            # GUI 用响应里的 project_root 与 path 在本机自己打开。
             path = request.get("path")
             if not isinstance(path, str) or not path:
                 raise ReadServiceError("path must be a non-empty string")
-            max_bytes = request.get("max_bytes", 1024 * 1024)
-            if (
-                isinstance(max_bytes, bool)
-                or not isinstance(max_bytes, int)
-                or not 1 <= max_bytes <= MAX_TEXT_BYTES
-            ):
-                raise ReadServiceError("max_bytes must be an integer between 1 and 5242880")
-            arguments.extend(["read-text", path, "--max-bytes", str(max_bytes)])
+            arguments.extend(["read-file", path])
         else:
             raise ReadServiceError("unsupported read operation")
         try:

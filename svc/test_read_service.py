@@ -28,7 +28,7 @@ from pathlib import Path
 log = Path(%r)
 with log.open('a', encoding='utf-8') as handle:
     handle.write(json.dumps(sys.argv[1:]) + '\\n')
-if 'read-text' in sys.argv and 'bad' in sys.argv:
+if 'read-file' in sys.argv and 'bad' in sys.argv:
     print(json.dumps({'ok': False, 'error': 'synthetic read failure'}))
     raise SystemExit(1)
 print(json.dumps({'ok': True, 'result': {'argv': sys.argv[1:]}}))
@@ -76,24 +76,24 @@ print(json.dumps({'ok': True, 'result': {'argv': sys.argv[1:]}}))
             {"op": "project", "project": project},
             {"op": "node", "project": project, "node_id": "n001"},
             {"op": "events", "project": project, "cursor": "evt_1", "limit": 2},
-            {"op": "text", "project": project, "path": "evidence/note.txt", "max_bytes": 128},
+            {"op": "file", "project": project, "path": "evidence/note.txt"},
         ]
         responses = [self.request(request) for request in requests]
         self.assertTrue(all(response["ok"] for response in responses))
         commands = [call[call.index("--format") + 2] for call in self.calls()]
-        self.assertEqual(commands, ["read-project", "read-node", "read-events", "read-text"])
+        self.assertEqual(commands, ["read-project", "read-node", "read-events", "read-file"])
         self.assertIn("--cursor", self.calls()[2])
-        self.assertIn("--max-bytes", self.calls()[3])
+        self.assertEqual(self.calls()[3][-2:], ["read-file", "evidence/note.txt"])
 
     def test_write_and_unknown_operations_are_rejected_without_calling_projectctl(self) -> None:
-        for operation in ("start", "submit", "review", "write", None):
+        for operation in ("start", "submit", "review", "write", "text", "amend", None):
             response = self.request({"op": operation, "project": "/synthetic/project"})
             self.assertFalse(response["ok"])
             self.assertIn("unsupported read operation", response["error"])
         self.assertEqual(self.calls(), [])
 
     def test_projectctl_error_is_returned_clearly(self) -> None:
-        response = self.request({"op": "text", "project": "/synthetic/project", "path": "bad"})
+        response = self.request({"op": "file", "project": "/synthetic/project", "path": "bad"})
         self.assertEqual(response, {"ok": False, "error": "synthetic read failure"})
 
     def test_invalid_limits_and_cursor_combination_are_rejected(self) -> None:
@@ -101,7 +101,8 @@ print(json.dumps({'ok': True, 'result': {'argv': sys.argv[1:]}}))
             {"op": "events", "project": "/synthetic/project", "limit": 0},
             {"op": "events", "project": "/synthetic/project", "limit": True},
             {"op": "events", "project": "/synthetic/project", "cursor": "a", "before": "b"},
-            {"op": "text", "project": "/synthetic/project", "path": "x", "max_bytes": 0},
+            {"op": "file", "project": "/synthetic/project", "path": ""},
+            {"op": "file", "project": "/synthetic/project", "path": 7},
         ]
         for request in requests:
             self.assertFalse(self.request(request)["ok"])
@@ -127,10 +128,11 @@ print(json.dumps({'ok': True, 'result': {'argv': sys.argv[1:]}}))
             slow.connect(str(socket_path))
             slow.sendall(b'{"op":"he')
             time.sleep(0.05)
+            # 容量拒绝在 accept 时立即回一行错误并关闭连接。客户端先读、不先写：
+            # 先写会和服务端关闭竞争（S7：BrokenPipeError），读则确定性拿到这一行。
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as extra:
                 extra.settimeout(2)
                 extra.connect(str(socket_path))
-                extra.sendall(b'{"op":"health"}\n')
                 busy = json.loads(extra.makefile("rb").readline())
             self.assertFalse(busy["ok"])
             self.assertIn("connection limit", busy["error"])
