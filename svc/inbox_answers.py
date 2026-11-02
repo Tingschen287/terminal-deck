@@ -83,10 +83,14 @@ def _answer_value_of(data: bytes, entry: dict[str, Any]) -> str | None:
 
 
 def _same_answer(a: str | None, b: str | None) -> bool:
+    """答复是否相同：只去掉首尾空白、统一换行符，其余逐字节比较（内部空白、全半角、标点都不归一）。
+
+    attempt 2 曾删除全部空白再比，「改成目录 `/tmp/a b`」与「`/tmp/ab`」被判相同（codex 评审 2 R4）。
+    """
     if a is None or b is None:
         return False
-    squash = lambda value: re.sub(r"[ \t　]+", "", value)
-    return squash(a) == squash(b)
+    norm = lambda value: value.replace("\r\n", "\n").replace("\r", "\n").strip().encode("utf-8")
+    return norm(a) == norm(b)
 
 
 # ---------------------------------------------------------------- 读取（不写盘）

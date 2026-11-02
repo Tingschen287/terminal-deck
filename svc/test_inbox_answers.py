@@ -230,6 +230,49 @@ class MergeFlowTests(AnswerTestCase):
             self.assertEqual(self.store.mark_handled(f"req-mm-{name}")["status"], "handled")
             self.assertEqual(self.status_of(f"req-mm-{name}")["status"], "handled")
 
+    def test_merged_answer_must_match_exactly(self) -> None:
+        """codex 评审 2 R4：只允许首尾空白不同；内部空白、全半角、标点不同都算「收件箱答复不同」。"""
+        recorded = "改成目录 `/tmp/a b`"
+        cases = [
+            ("改成目录 `/tmp/ab`", False),       # 评审复现：内部空格被删
+            ("改成目录 `/tmp/a  b`", False),     # 内部空格变两个
+            ("改成目录 `/tmp/a　b`", False),     # 半角空格换成全角空格
+            ("改成目录　`/tmp/a b`", False),     # 另一处半角换全角
+            ("改成目录 `/tmp/a b`。", False),    # 多了标点
+            ("改成目录 `/tmp/a b`  ", True),     # 尾随空白
+            ("改成目录 `/tmp/a b`　", True),     # 尾随全角空格
+            ("改成目录 `/tmp/a b`", True),
+        ]
+        original = (TESTDATA / "structure.md").read_bytes()
+        entry = entry_at(inbox.parse_inbox(original), 29)
+        for index, (written, same) in enumerate(cases):
+            self.path.write_bytes(original)
+            self.answers.unlink(missing_ok=True)
+            request_id = f"req-exact-{index:02d}"
+            self.store.answer(**self.request(29, "change", recorded[2:], request_id=request_id))
+            self.assertEqual(self.records()[0]["answer"], recorded)
+            self.path.write_bytes(original[: entry["byte_end"]] + (" 你答：" + written).encode("utf-8")
+                                  + original[entry["byte_end"] :])
+            status = self.status_of(request_id)
+            if same:
+                self.assertEqual(status["status"], "in_inbox", written)
+                self.assertEqual(self.store.mark_merged(request_id)["status"], "merged")
+            else:
+                self.assertEqual((status["status"], status.get("reason")),
+                                 ("needs_review", "entry_answered_differently"), written)
+                self.assert_code("needs_review", self.store.mark_merged, request_id)
+                self.assertNotIn("merged", [r["type"] for r in self.records()])
+
+    def test_same_answer_unit(self) -> None:
+        same = inbox_answers._same_answer
+        self.assertTrue(same("行", " 行\r\n"))
+        self.assertTrue(same("改成 A\r\nB", "改成 A\nB"))
+        self.assertFalse(same("改成 /tmp/a b", "改成 /tmp/ab"))
+        self.assertFalse(same("改成 a b", "改成 a\tb"))
+        self.assertFalse(same("改成 Ａ", "改成 A"))  # 全角字母不归一
+        self.assertFalse(same("改成 A，B", "改成 A,B"))
+        self.assertFalse(same(None, "行"))
+
     def test_pending_cli(self) -> None:
         self.store.answer(**self.request(29, request_id="req-cli-0001"))
         completed = subprocess.run([sys.executable, str(SVC / "inbox_answers.py"), "--inbox", str(self.path), "pending"],
