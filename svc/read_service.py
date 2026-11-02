@@ -3,6 +3,8 @@
 
 The service relays metadata-only JSON: no evidence, review, loop-log or event
 body text crosses the socket (projectctl returns whitelist projections only).
+The optional owner inbox view (op "inbox", n077) follows the same rule: entry
+text is returned as byte ranges plus sha256, never as text.
 """
 
 from __future__ import annotations
@@ -19,6 +21,9 @@ import subprocess
 import sys
 import threading
 from typing import Any
+
+from inbox import InboxError
+from inbox_answers import inbox_view
 
 
 MAX_REQUEST_BYTES = 64 * 1024
@@ -43,6 +48,15 @@ SERVICE_ERROR_MESSAGES = {
     "projectctl_invalid_response": "projectctl returned an invalid response",
     "projectctl_failed": "projectctl read failed",
     "internal_error": "internal read service error",
+    # 收件箱读取（n077）：文件路径由服务启动参数 --inbox 指定，请求里不能指定路径。
+    "inbox_not_configured": "inbox read is not configured on this service",
+    "inbox_unsafe": "inbox is not a single regular file",
+    "inbox_unreadable": "inbox could not be read",
+    "inbox_too_large": "inbox is too large",
+    "inbox_invalid_encoding": "inbox is not valid UTF-8",
+    "answers_unsafe": "answers file is not a single regular file",
+    "answers_unreadable": "answers file could not be read",
+    "answers_too_large": "answers file is too large",
 }
 # projectctl 读取命令的固定错误码（见 projectctl READ_ERROR_MESSAGES）；svc 只转发错误码。
 PROJECTCTL_READ_ERROR_CODES = frozenset(
@@ -204,10 +218,12 @@ class ReadServer(socketserver.ThreadingUnixStreamServer):
         *,
         max_connections: int = MAX_CONCURRENT_CONNECTIONS,
         connection_read_timeout: float = CONNECTION_READ_TIMEOUT,
+        inbox_path: str | None = None,
     ) -> None:
         if max_connections < 1 or connection_read_timeout <= 0:
             raise ValueError("connection limits must be positive")
         self.client = client
+        self.inbox_path = os.path.abspath(inbox_path) if inbox_path else None
         self.connection_read_timeout = connection_read_timeout
         self._connection_slots = threading.BoundedSemaphore(max_connections)
         super().__init__(socket_path, ReadRequestHandler)
@@ -243,10 +259,28 @@ class ReadServer(socketserver.ThreadingUnixStreamServer):
     def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         if request.get("op") == "health":
             return {"ok": True, "result": {"status": "ok", "service": "anpai-read", "version": 1}}
+        if request.get("op") == "inbox":
+            return self.read_inbox()
         return self.client.call(request)
 
+    def read_inbox(self) -> dict[str, Any]:
+        """收件箱的结构化结果：待你定、已定、信任档位表，叠加答复文件里未合并的答复。
+        只读、不写盘，人写文本只给字节范围与 sha256，答复只给 request_id 与 sha256。
 
-def serve(socket_path: str, projectctl: str) -> int:
+        写回答复不在本服务：见 inbox_write_service.py（另一个进程、另一个 socket，只给 owner 界面）。
+        """
+        if not self.inbox_path:
+            raise ReadServiceError("inbox_not_configured")
+        try:
+            result = inbox_view(self.inbox_path)
+        except InboxError as exc:
+            code = exc.code if exc.code in SERVICE_ERROR_MESSAGES else "internal_error"
+            log_code(code)
+            raise ReadServiceError(code) from exc
+        return {"ok": True, "result": result}
+
+
+def serve(socket_path: str, projectctl: str, inbox_path: str | None = None) -> int:
     path = Path(socket_path).expanduser().absolute()
     if len(os.fsencode(path)) > 96:
         raise ReadServiceError("argument_invalid", "socket path is too long; use a path of at most 96 bytes")
@@ -256,7 +290,7 @@ def serve(socket_path: str, projectctl: str) -> int:
     client = ProjectCtlClient(projectctl)
     previous_umask = os.umask(0o177)
     try:
-        server = ReadServer(str(path), client)
+        server = ReadServer(str(path), client, inbox_path=inbox_path)
     finally:
         os.umask(previous_umask)
     try:
@@ -292,12 +326,13 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser = subparsers.add_parser("serve")
     serve_parser.add_argument("--socket", required=True)
     serve_parser.add_argument("--projectctl", required=True)
+    serve_parser.add_argument("--inbox", help="owner inbox file to serve read-only (op: inbox)")
     health_parser = subparsers.add_parser("health")
     health_parser.add_argument("--socket", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "serve":
-            return serve(args.socket, args.projectctl)
+            return serve(args.socket, args.projectctl, args.inbox)
         response = health(args.socket)
         print(json.dumps(response, ensure_ascii=False, indent=2, allow_nan=False))
         return 0 if response.get("ok") else 1
