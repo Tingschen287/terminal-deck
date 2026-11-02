@@ -76,6 +76,13 @@ _DEFAULT_RE = re.compile(r"^(?P<day>\d{4}-\d{2}-\d{2})[ \t　]+(?P<text>\S.*)$")
 _ACTION_GRAPH_RE = re.compile(r"^graph[ \t]+(?P<project>[a-z0-9][a-z0-9-]{0,63})/(?P<node>[A-Za-z0-9_]{1,64})$")
 _ACTION_STAFF_RE = re.compile(r"^staff[ \t]+(?P<definition>[a-z0-9][a-z0-9_-]{0,63})$")
 
+# 标题规范（owner 2026-11-02）：涉及项目或节点时写 `[项目简称·节点简称 编号]`，不只写裸节点 id。
+# 裸 id 只产生警告码，不影响解析与写回。代码片段（反引号内，多为路径）不查。
+_BARE_NODE_ID_RE = re.compile(r"(?<![A-Za-z0-9_])n\d{3}[a-z]?(?:_[a-z0-9_]+)?(?![A-Za-z0-9_])")
+_CANONICAL_NODE_REF_RE = re.compile(r"\[[^\[\]·]+·[^\[\]]*?[ \t]n\d{3}[a-z]?\]")
+_CODE_SPAN_RE = re.compile(r"`[^`]*`")
+TITLE_WARNING_BARE_NODE_ID = "title_bare_node_id"
+
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f​-‏‪-‮⁦-⁩﻿]")
 _SECRET_LIKE_RE = re.compile(
     r"(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|glpat-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}"
@@ -225,6 +232,12 @@ def possibly_answered(line: Line) -> bool:
     return bool(_BARE_CHANGE_RE.search(line.text) or _BARE_SHORT_RE.search(line.text))
 
 
+def title_warnings(text: str) -> list[str]:
+    """标题的格式警告码（不改变解析结果）。"""
+    stripped = _CANONICAL_NODE_REF_RE.sub(" ", _CODE_SPAN_RE.sub(" ", text))
+    return [TITLE_WARNING_BARE_NODE_ID] if _BARE_NODE_ID_RE.search(stripped) else []
+
+
 def _answer_dict(data: bytes, answer: Answer) -> dict[str, Any]:
     result: dict[str, Any] = {"kind": answer.kind, "form": answer.form, "line": answer.line.number}
     if answer.kind == "change":
@@ -306,6 +319,8 @@ def _parse_entry(data: bytes, section: str, lines: list[Line]) -> dict[str, Any]
             }
         )
     entry["status"] = "parsed"
+    title_ref = entry["title"]
+    entry["warnings"] = title_warnings(data[title_ref["byte_start"] : title_ref["byte_end"]].decode("utf-8"))
     entry["answer"] = _answer_dict(data, answer) if answer else None
     entry["answer_possible"] = answer is None and possibly_answered(lines[-1])
     if section != "pending":
@@ -591,6 +606,7 @@ def parse_inbox(data: bytes) -> dict[str, Any]:
             "v2": sum(1 for e in entries if e.get("format") == "v2"),
             "answered": sum(1 for e in entries if e.get("answer")),
             "possibly_answered": sum(1 for e in entries if e.get("answer_possible")),
+            "warned": sum(1 for e in entries if e.get("warnings")),
             "answerable": sum(1 for e in entries if e.get("answerable")),
         }
     result["counts"] = counts

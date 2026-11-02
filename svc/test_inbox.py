@@ -304,6 +304,56 @@ class RoundTripTests(unittest.TestCase):
         self.assertEqual(checked, 3 * (4 + 6))
 
 
+class TitleLintTests(unittest.TestCase):
+    """owner 2026-11-02：标题涉及项目或节点时写 `[项目简称·节点简称 编号]`；裸节点 id 只给警告，不拦解析与写回。"""
+
+    def test_bare_node_id_warns_canonical_does_not(self) -> None:
+        parsed = inbox.parse_inbox(load("lint.md"))
+        expected = {5: [], 6: ["title_bare_node_id"], 7: ["title_bare_node_id"], 8: ["title_bare_node_id"],
+                    9: ["title_bare_node_id"], 12: []}
+        self.assertEqual({e["line_start"]: e["warnings"] for e in parsed["pending"]}, expected)
+        self.assertEqual(parsed["counts"]["pending"]["warned"], 4)
+        # 只查标题：新格式背景里的裸编号不算；反引号里的路径不算
+        self.assertEqual(entry_at(parsed, 12)["warnings"], [])
+        self.assertEqual(entry_at(parsed, 5)["warnings"], [])
+        # 已定区旧条目也只是警告，状态不变
+        decided = parsed["decided"][0]
+        self.assertEqual((decided["status"], decided["warnings"]), ("parsed", ["title_bare_node_id"]))
+
+    def test_warning_does_not_change_parse_or_writeback(self) -> None:
+        data = load("lint.md")
+        parsed = inbox.parse_inbox(data)
+        for line in (6, 7, 8, 9):
+            entry = entry_at(parsed, line)
+            self.assertEqual(entry["status"], "parsed")
+            self.assertTrue(entry["answerable"], line)
+            new = apply(data, line, "行")
+            target = entry_at(inbox.parse_inbox(new), line)
+            self.assertEqual(target["answer"]["kind"], "yes")
+            self.assertEqual(target["warnings"], ["title_bare_node_id"])  # 答复不进标题，警告照旧
+
+    def test_title_warnings_unit(self) -> None:
+        cases = {
+            "[安排·读取接口 n075] 第 6 轮": [],
+            "[只读查库·查询取消调查 n005a] 额度": [],
+            "依据 `infra/4.eval/reports/n003-sql.md`": [],
+            "n075 第 6 轮": ["title_bare_node_id"],
+            "[安排] n075_read_interface 收口": ["title_bare_node_id"],
+            "拦截库n003 紧挨中文": ["title_bare_node_id"],
+            "[只读查库·SQL 拦截库 n003] 与 n004 一起": ["title_bare_node_id"],
+            "mv2_contract 第 3 轮": [],
+            "evt_000123 与 an075x 不算": [],
+        }
+        for text, expected in cases.items():
+            self.assertEqual(inbox.title_warnings(text), expected, text)
+
+    def test_existing_fixtures_have_no_warnings(self) -> None:
+        for name in ("structure.md", "variants.md"):
+            parsed = inbox.parse_inbox(load(name))
+            self.assertEqual(parsed["counts"]["pending"]["warned"], 0, name)
+            self.assertEqual(parsed["counts"]["decided"]["warned"], 0, name)
+
+
 def supervisor_moves_to_decided(data: bytes, line: int) -> bytes:
     """模拟主管照 playbook 办完：把条目从「待你定」挪到「已定」并打勾（主管手工做的事，写回服务不做）。"""
     lines = data.decode("utf-8").split("\n")

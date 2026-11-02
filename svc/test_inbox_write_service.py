@@ -298,6 +298,16 @@ class ReadWriteSeparationTests(unittest.TestCase):
         self.assertIn(CANARY, raw.decode("utf-8"))
         self.assertEqual(inbox.sha256_hex(raw), title["sha256"])
 
+    def test_read_service_returns_title_warnings(self) -> None:
+        shutil.copyfile(TESTDATA / "inbox" / "lint.md", self.inbox)
+        response = self.request({"op": "inbox"})
+        self.assertTrue(response["ok"])
+        warnings = {e["line_start"]: e["warnings"] for e in response["result"]["pending"]}
+        self.assertEqual(warnings[5], [])
+        self.assertEqual(warnings[6], ["title_bare_node_id"])
+        self.assertEqual(response["result"]["counts"]["pending"]["warned"], 4)
+        self.assertNotIn(CANARY, json.dumps(response, ensure_ascii=False))
+
     def test_read_service_cannot_write(self) -> None:
         before = self.inbox.read_bytes()
         stat_before = os.stat(self.inbox)
