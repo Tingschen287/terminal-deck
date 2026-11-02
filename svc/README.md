@@ -52,8 +52,8 @@ python3.12 svc/read_service.py health --socket /tmp/anpai-read-$UID.sock
 
 错误响应固定为 `{"ok":false,"error":"<错误码>","message":"<固定说明>"}`，不含任何请求内容、
 projectctl 输出或异常文本。服务的 stderr 同样只写固定错误码（每行 `read service error: <错误码>`），
-不转写 projectctl 的 stderr（默认直接丢弃）、不写异常文本或请求内容；需要调试时显式设置
-`PROJECTCTL_READ_DEBUG=1` 启动服务，原始细节才写到本机 stderr，默认关闭。服务自身的错误码：`request_invalid`、
+任何运行模式下都不收集、不转写 projectctl 的 stderr（直接丢弃），不写异常文本或请求内容，
+没有调试开关。服务自身的错误码：`request_invalid`、
 `request_timeout`、`capacity_reached`、`unsupported_operation`、`argument_invalid`、
 `projectctl_unavailable`、`projectctl_timeout`、`projectctl_invalid_response`、
 `projectctl_failed`、`internal_error`；projectctl 的读取错误码（`node_not_found`、
