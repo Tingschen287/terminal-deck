@@ -14,6 +14,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifndef BUILD_TAG
+#define BUILD_TAG "owner"
+#endif
+
 static int run_client(const char *sock, const char *request, const char *out) {
     char buf[65536];
     int in = open(request, O_RDONLY);
@@ -58,6 +62,6 @@ int main(int argc, char **argv) {
         return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
     }
     if (argc == 4) return run_client(argv[1], argv[2], argv[3]);
-    fprintf(stderr, "usage\n");
+    fprintf(stderr, "usage (%s)\n", BUILD_TAG);
     return 64;
 }

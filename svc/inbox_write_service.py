@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""owner 收件箱答复写回服务（n077）：与只读服务分开的进程、分开的 socket。
+"""owner 答复写回服务（n077）：与只读服务分开的进程、分开的 socket。
 
-只有一种写操作 ``answer``：在「待你定」的一条条目末尾追加 owner 的答复（行 / 不 / 改成……）。
-每条连接先做身份判定（owner_identity.OwnerClientPolicy），不是 owner 界面一律拒绝。
+只有一种写操作 ``answer``：把 owner 对「待你定」某条条目的答复（行 / 不 / 改成……）追加进同目录的答复文件
+（inbox_answers.AnswerStore）。**本服务不打开 owner-inbox.md 写**；合并回收件箱由主管做（attempt 2，owner 选 A）。
+每条连接先做身份判定（owner_identity.OwnerClientPolicy，macOS 代码签名），不是 owner 界面一律拒绝。
 错误响应只有固定错误码与固定说明，不回显请求内容；stderr 也只写固定错误码。
 """
 
@@ -20,7 +21,7 @@ import threading
 from typing import Any, Callable
 
 from inbox import InboxError
-from inbox_writer import InboxWriter, WriteRejected
+from inbox_answers import AnswerRejected, AnswerStore
 from owner_identity import IdentityError, OwnerClientPolicy
 
 
@@ -36,17 +37,20 @@ ERROR_MESSAGES = {
     "caller_uid_mismatch": "caller is not this user",
     "caller_not_owner_client": "only the owner interface may answer inbox entries",
     "owner_client_under_agent": "owner interface was launched by an agent process",
-    "owner_client_changed": "registered owner interface executable changed since service start",
-    "owner_client_invalid": "owner interface executable is not acceptable",
+    "owner_client_invalid": "owner interface executable is not validly signed or requirement is invalid",
     "identity_unavailable": "caller identity could not be established",
     "identity_unsupported_platform": "caller identity is not supported on this platform",
     # 收件箱与条目
-    "inbox_changed": "inbox changed since it was read; re-read and try again",
+    "entry_locator_ambiguous": "another entry has the same date, supervisor and title; answer it in the file",
+    "answers_unsafe": "answers file is not a single regular file",
+    "answers_unreadable": "answers file could not be read",
+    "answers_too_large": "answers file is too large",
+    "answers_write_failed": "answer could not be recorded",
     "inbox_unsafe": "inbox is not a single regular file",
     "inbox_unreadable": "inbox could not be read",
     "inbox_too_large": "inbox is too large",
     "inbox_invalid_encoding": "inbox is not valid UTF-8",
-    "entry_not_found": "entry not found at that line with that hash",
+    "entry_not_found": "entry not found; re-read the inbox and try again",
     "entry_not_pending": "entry is not an open pending entry",
     "entry_no_checkbox": "entry has no checkbox",
     "entry_unparsed": "entry could not be parsed; answer it in the file",
@@ -56,12 +60,7 @@ ERROR_MESSAGES = {
     "answer_secret_like": "answer text looks like a secret",
     # 写入过程
     "request_id_conflict": "request id was used with a different request",
-    "request_uncertain": "previous attempt with this request id has an uncertain result",
     "writer_busy": "another write is in progress",
-    "swap_unavailable": "filesystem does not support atomic exchange",
-    "roundtrip_failed": "answer would not parse back; nothing written",
-    "write_failed": "write failed; nothing replaced",
-    "log_failed": "writeback record could not be written",
     "internal_error": "internal write service error",
 }
 
@@ -143,7 +142,7 @@ class WriteRequestHandler(socketserver.StreamRequestHandler):
         except IdentityError as exc:
             log_code(exc.code)
             return error_response(exc.code)
-        except WriteRejected as exc:
+        except AnswerRejected as exc:
             log_code(exc.code)
             return error_response(exc.code, exc.current_sha256)
         except InboxError as exc:
@@ -158,7 +157,7 @@ class WriteServer(socketserver.UnixStreamServer):
     def __init__(
         self,
         socket_path: str,
-        writer: InboxWriter,
+        writer: AnswerStore,
         check_identity: Callable[[socket.socket], int],
         *,
         connection_read_timeout: float = CONNECTION_READ_TIMEOUT,
@@ -172,7 +171,7 @@ class WriteServer(socketserver.UnixStreamServer):
         log_code("internal_error")
 
 
-def serve(socket_path: str, inbox_path: str, state_dir: str, owner_clients: list[str]) -> int:
+def serve(socket_path: str, inbox_path: str, owner_clients: list[str], owner_requirements: list[str]) -> int:
     path = Path(socket_path).expanduser().absolute()
     if len(os.fsencode(path)) > 96:
         raise InboxError("argument_invalid")
@@ -181,8 +180,8 @@ def serve(socket_path: str, inbox_path: str, state_dir: str, owner_clients: list
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.stat(path.parent).st_mode & 0o077:
         raise InboxError("argument_invalid")
-    policy = OwnerClientPolicy(owner_clients)
-    writer = InboxWriter(os.path.abspath(inbox_path), state_dir)
+    policy = OwnerClientPolicy(owner_clients, requirements=owner_requirements)
+    writer = AnswerStore(os.path.abspath(inbox_path))
     previous_umask = os.umask(0o177)
     try:
         server = WriteServer(str(path), writer, policy.check)
@@ -209,12 +208,14 @@ def main(argv: list[str] | None = None) -> int:
     serve_parser = subparsers.add_parser("serve")
     serve_parser.add_argument("--socket", required=True)
     serve_parser.add_argument("--inbox", required=True)
-    serve_parser.add_argument("--state-dir", required=True)
-    serve_parser.add_argument("--owner-client", action="append", required=True,
-                              help="absolute path of an owner interface executable; repeatable")
+    serve_parser.add_argument("--owner-client", action="append", default=[],
+                              help="absolute path of a code-signed owner interface executable; its designated "
+                                   "requirement is pinned at start; repeatable")
+    serve_parser.add_argument("--owner-requirement", action="append", default=[],
+                              help="code signing requirement string an owner interface must satisfy; repeatable")
     args = parser.parse_args(argv)
     try:
-        return serve(args.socket, args.inbox, args.state_dir, args.owner_client)
+        return serve(args.socket, args.inbox, args.owner_client, args.owner_requirement)
     except (InboxError, IdentityError) as exc:
         code = exc.code if exc.code in ERROR_MESSAGES else "internal_error"
         print(f"ERROR: {code}: {ERROR_MESSAGES[code]}", file=sys.stderr)

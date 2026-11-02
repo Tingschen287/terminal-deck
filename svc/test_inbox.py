@@ -136,6 +136,15 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(entry_at(parsed, 22)["action"], {"kind": "staff", "definition": "reviewer-def"})
         self.assertEqual(entry_at(parsed, 25)["action"]["kind"], "text")
 
+    def test_v2_default_without_day(self) -> None:
+        """默认可以没有默认日（如对外消息「不回复就不发」，真实文件里已有这种写法）；像日期但不合法的仍拒。"""
+        head = "## 待你定\n\n- [ ] 2026-01-10 · 主管甲 · 夹具 ZQX 对外消息\n  - 选项：A 发；B 不发\n"
+        good = inbox.parse_inbox((head + "  - 默认：夹具 ZQX 不回复就不发\n").encode("utf-8"))["pending"][0]
+        self.assertEqual((good["status"], good["default"]["day"]), ("parsed", None))
+        for bad in ("2026-13-40 按 A 办", "2026-1-5 按 A 办"):
+            entry = inbox.parse_inbox((head + f"  - 默认：{bad}\n").encode("utf-8"))["pending"][0]
+            self.assertEqual((entry["status"], entry["reason"]), ("unparsed", "v2_default_invalid"), bad)
+
     def test_unparsed_entries_are_kept_not_guessed(self) -> None:
         parsed = inbox.parse_inbox(load("variants.md"))
         expected = {

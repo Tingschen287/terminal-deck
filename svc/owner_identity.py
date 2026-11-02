@@ -1,22 +1,26 @@
-"""写回入口的调用者身份判定（n077）：只有 owner 界面能经写回 socket 回答决定。
+"""写回入口的调用者身份判定（n077 attempt 2）：只有 owner 界面能经写回 socket 回答决定。
 
-沿用 deckd（work/internal/identity）的思路，按「SwiftUI 客户端 + 本机服务」重审：
+判定以 macOS 代码签名为准（owner 2026-11-02 选 A，「R3 按你建议」）：
 
 1. socket 权限：写回 socket 在 0700 目录里、本身 0600，只有本用户能连。
-2. 对端凭据（macOS）：LOCAL_PEERCRED 的 uid、LOCAL_PEERTOKEN 审计令牌里的 euid 都必须是本用户；
-   令牌里的 pid 与 LOCAL_PEERPID 一致。
-3. 生命周期绑定：令牌里的 pidversion 是「建立连接的那个进程」的代际号；判定前后各核对一次
-   proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO) 读到的代际号，pid 被复用或对端 exec 过就拒绝。
-4. 主判定——可执行文件白名单：对端进程的可执行文件（proc_pidpath，取 realpath）必须是服务启动时
-   用 --owner-client 登记的 owner 界面程序之一；登记时记下 (dev, inode, 大小, mtime)，之后文件被换掉就拒绝。
-   主管（Claude Code、codex、opencode……）与分身是别的程序，直接连 socket 一律被拒。
-5. 辅助判定——进程链：从对端沿父进程向上到 launchd，任何一层是已知 Agent CLI（按可执行文件路径与
-   argv 判定）就拒绝。它挡的是「主管或分身把 owner 界面程序当子进程拉起来」这种直接做法；
-   双 fork 脱离进程链可以绕过它，所以它只是辅助，主判定是第 4 条，前提是 owner 界面程序没有
-   无界面的答复入口（不接受命令行参数、URL scheme、AppleScript 代为答复）。
+2. 对端凭据：LOCAL_PEERCRED 的 uid、LOCAL_PEERTOKEN 审计令牌里的 euid 都必须是本用户；令牌里的 pid 与 LOCAL_PEERPID 一致。
+3. **主判定——代码签名**：用连接的审计令牌（建立连接那一刻的 pid + pidversion）向 Security 框架取对端的
+   SecCode（``SecCodeCopyGuestWithAttributes`` + ``kSecGuestAttributeAudit``），再用 ``SecCodeCheckValidity`` 校验：
+   签名有效（运行中的代码与磁盘上的签名都没被改）且满足登记的 designated requirement。
+   - 登记方式：服务启动时 ``--owner-client <已签名的 owner 界面程序>``，从程序本身取 designated requirement
+     （``SecStaticCodeCreateWithPath`` + ``SecCodeCopyDesignatedRequirement``）并先做一次静态校验；
+     也可用 ``--owner-requirement '<requirement 字符串>'`` 直接给。
+   - ad-hoc 签名（本机 ``codesign -s - <程序>``）的 designated requirement 是 ``cdhash H"…"``，钉死这一份二进制：
+     程序被改任何一个字节，或改完重新 ad-hoc 签名，cdhash 都变，一律被拒；换新版要重启服务重新登记。
+     用本地证书签名时 requirement 是「identifier + 证书」，同一证书签的新版可用，别人（含 ad-hoc 重签）不行。
+   - 不再看可执行文件路径、inode、mtime：这些同用户可改可恢复（attempt 1 评审 R3）。
+   - pid 复用或对端 exec：审计令牌带 pidversion，Security 框架按它取进程，对不上即失败。
+4. 辅助判定——进程链：从对端沿父进程向上到 launchd，任何一层是已知 Agent CLI 就拒绝。
+   它挡「主管或分身把 owner 界面程序当子进程拉起」；双 fork 能绕过它，所以只是辅助。
 
-与 deckd 相同的边界：防的是模型越权与误操作；同一系统用户下的恶意代码（ptrace、注入 owner 界面进程、
-替换后重启服务）防不住。非 macOS 平台一律拒绝（fail closed）。
+剩余边界（与 deckd 相同）：防的是模型越权与误操作。同一系统用户下能 ptrace / 注入 owner 界面进程、
+或改掉服务启动参数后重启服务的恶意代码防不住。owner 界面程序本身不得提供无界面的答复入口
+（命令行参数、URL scheme、AppleScript），否则签名对也没用——这一条交 G4 合同。非 macOS 一律拒绝。
 """
 
 from __future__ import annotations
@@ -24,10 +28,8 @@ from __future__ import annotations
 import ctypes
 import os
 import socket
-import stat
 import struct
 import sys
-from dataclasses import dataclass
 from typing import Callable
 
 
@@ -39,11 +41,10 @@ XUCRED_SIZE = 76
 AUDIT_TOKEN_SIZE = 32
 PROC_PIDTBSDINFO = 3
 PROC_PIDTBSDINFO_SIZE = 136
-PROC_PIDUNIQIDENTIFIERINFO = 17
-PROC_UNIQIDENTIFIERINFO_SIZE = 56
 PROC_PIDPATHINFO_MAXSIZE = 4096
 CTL_KERN = 1
 KERN_PROCARGS2 = 49
+K_CF_STRING_ENCODING_UTF8 = 0x08000100
 
 AGENT_NAMES = frozenset(
     {
@@ -63,27 +64,100 @@ class IdentityError(Exception):
         self.code = code
 
 
-@dataclass(frozen=True)
-class RegisteredClient:
-    path: str
-    dev: int
-    ino: int
-    size: int
-    mtime_ns: int
+class _Security:
+    """CoreFoundation / Security 框架的最小 ctypes 绑定。"""
 
+    def __init__(self) -> None:
+        vp = ctypes.c_void_p
+        self.cf = cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        self.sec = sec = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+        cf.CFDataCreate.restype = vp
+        cf.CFDataCreate.argtypes = [vp, ctypes.c_char_p, ctypes.c_long]
+        cf.CFStringCreateWithCString.restype = vp
+        cf.CFStringCreateWithCString.argtypes = [vp, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFURLCreateFromFileSystemRepresentation.restype = vp
+        cf.CFURLCreateFromFileSystemRepresentation.argtypes = [vp, ctypes.c_char_p, ctypes.c_long, ctypes.c_bool]
+        cf.CFDictionaryCreate.restype = vp
+        cf.CFDictionaryCreate.argtypes = [vp, ctypes.POINTER(vp), ctypes.POINTER(vp), ctypes.c_long, vp, vp]
+        cf.CFRelease.argtypes = [vp]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFStringGetCString.argtypes = [vp, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        self.key_callbacks = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")
+        self.value_callbacks = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks")
+        self.audit_key = vp.in_dll(sec, "kSecGuestAttributeAudit")
+        sec.SecCodeCopyGuestWithAttributes.argtypes = [vp, vp, ctypes.c_uint32, ctypes.POINTER(vp)]
+        sec.SecCodeCopyGuestWithAttributes.restype = ctypes.c_int32
+        sec.SecRequirementCreateWithString.argtypes = [vp, ctypes.c_uint32, ctypes.POINTER(vp)]
+        sec.SecRequirementCreateWithString.restype = ctypes.c_int32
+        sec.SecRequirementCopyString.argtypes = [vp, ctypes.c_uint32, ctypes.POINTER(vp)]
+        sec.SecRequirementCopyString.restype = ctypes.c_int32
+        sec.SecCodeCheckValidity.argtypes = [vp, ctypes.c_uint32, vp]
+        sec.SecCodeCheckValidity.restype = ctypes.c_int32
+        sec.SecStaticCodeCreateWithPath.argtypes = [vp, ctypes.c_uint32, ctypes.POINTER(vp)]
+        sec.SecStaticCodeCreateWithPath.restype = ctypes.c_int32
+        sec.SecStaticCodeCheckValidity.argtypes = [vp, ctypes.c_uint32, vp]
+        sec.SecStaticCodeCheckValidity.restype = ctypes.c_int32
+        sec.SecCodeCopyDesignatedRequirement.argtypes = [vp, ctypes.c_uint32, ctypes.POINTER(vp)]
+        sec.SecCodeCopyDesignatedRequirement.restype = ctypes.c_int32
 
-def register_client(path: str) -> RegisteredClient:
-    """登记一个 owner 界面程序：绝对路径、普通文件、可执行、组和其他人不可写。"""
-    if not os.path.isabs(path):
-        raise IdentityError("owner_client_invalid")
-    real = os.path.realpath(path)
-    try:
-        info = os.stat(real)
-    except OSError as exc:
-        raise IdentityError("owner_client_invalid") from exc
-    if not stat.S_ISREG(info.st_mode) or not os.access(real, os.X_OK) or info.st_mode & 0o022:
-        raise IdentityError("owner_client_invalid")
-    return RegisteredClient(real, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    def release(self, *refs: ctypes.c_void_p) -> None:
+        for ref in refs:
+            if ref:
+                self.cf.CFRelease(ref)
+
+    def requirement_from_string(self, text: str) -> ctypes.c_void_p:
+        string = self.cf.CFStringCreateWithCString(None, text.encode("utf-8"), K_CF_STRING_ENCODING_UTF8)
+        requirement = ctypes.c_void_p()
+        status = self.sec.SecRequirementCreateWithString(string, 0, ctypes.byref(requirement))
+        self.release(string)
+        if status != 0 or not requirement:
+            raise IdentityError("owner_client_invalid")
+        return requirement
+
+    def requirement_string(self, requirement: ctypes.c_void_p) -> str:
+        string = ctypes.c_void_p()
+        if self.sec.SecRequirementCopyString(requirement, 0, ctypes.byref(string)) != 0:
+            raise IdentityError("owner_client_invalid")
+        buffer = ctypes.create_string_buffer(4096)
+        ok = self.cf.CFStringGetCString(string, buffer, len(buffer), K_CF_STRING_ENCODING_UTF8)
+        self.release(string)
+        if not ok:
+            raise IdentityError("owner_client_invalid")
+        return buffer.value.decode("utf-8")
+
+    def designated_requirement(self, path: str) -> ctypes.c_void_p:
+        """取已签名程序的 designated requirement，并先静态校验程序满足它（未签名、签名坏的拒绝）。"""
+        raw = os.fsencode(path)
+        url = self.cf.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), False)
+        static = ctypes.c_void_p()
+        requirement = ctypes.c_void_p()
+        try:
+            if not url or self.sec.SecStaticCodeCreateWithPath(url, 0, ctypes.byref(static)) != 0:
+                raise IdentityError("owner_client_invalid")
+            if self.sec.SecCodeCopyDesignatedRequirement(static, 0, ctypes.byref(requirement)) != 0 or not requirement:
+                raise IdentityError("owner_client_invalid")
+            if self.sec.SecStaticCodeCheckValidity(static, 0, requirement) != 0:
+                self.release(requirement)
+                raise IdentityError("owner_client_invalid")
+            return requirement
+        finally:
+            self.release(url, static)
+
+    def check_peer(self, token: bytes, requirement: ctypes.c_void_p) -> int:
+        """按审计令牌取对端代码并校验；返回 OSStatus（0 为通过）。"""
+        data = self.cf.CFDataCreate(None, token, len(token))
+        keys = (ctypes.c_void_p * 1)(self.audit_key.value)
+        values = (ctypes.c_void_p * 1)(data)
+        attributes = self.cf.CFDictionaryCreate(None, keys, values, 1, ctypes.addressof(self.key_callbacks),
+                                                ctypes.addressof(self.value_callbacks))
+        code = ctypes.c_void_p()
+        try:
+            status = self.sec.SecCodeCopyGuestWithAttributes(None, attributes, 0, ctypes.byref(code))
+            if status != 0 or not code:
+                return status or -1
+            return self.sec.SecCodeCheckValidity(code, 0, requirement)
+        finally:
+            self.release(code, attributes, data)
 
 
 class _Darwin:
@@ -99,13 +173,6 @@ class _Darwin:
             ctypes.c_void_p, ctypes.c_size_t,
         ]
         self.libc.sysctl.restype = ctypes.c_int
-
-    def pid_version(self, pid: int) -> int:
-        buffer = ctypes.create_string_buffer(PROC_UNIQIDENTIFIERINFO_SIZE)
-        size = self.proc.proc_pidinfo(pid, PROC_PIDUNIQIDENTIFIERINFO, 0, buffer, PROC_UNIQIDENTIFIERINFO_SIZE)
-        if size != PROC_UNIQIDENTIFIERINFO_SIZE:
-            raise IdentityError("identity_unavailable")
-        return struct.unpack_from("<I", buffer.raw, 32)[0]
 
     def parent(self, pid: int) -> int:
         buffer = ctypes.create_string_buffer(PROC_PIDTBSDINFO_SIZE)
@@ -167,48 +234,55 @@ def is_agent_process(path: str, argv: list[str]) -> bool:
 class OwnerClientPolicy:
     """对一条已接受的连接做身份判定；通过返回对端 pid，否则抛 IdentityError（固定码）。"""
 
-    def __init__(self, clients: list[str], *, platform: str | None = None) -> None:
-        if not clients:
+    def __init__(self, clients: list[str] | None = None, *, requirements: list[str] | None = None,
+                 platform: str | None = None) -> None:
+        clients = list(clients or [])
+        requirements = list(requirements or [])
+        if not clients and not requirements:
             raise IdentityError("owner_client_invalid")
-        self.clients = {c.path: c for c in (register_client(path) for path in clients)}
+        for path in clients:
+            if not os.path.isabs(path):
+                raise IdentityError("owner_client_invalid")
         self.platform = platform or sys.platform
-        self._darwin = _Darwin() if self.platform == "darwin" else None
+        self.requirement_strings: list[str] = []
+        self._requirements: list[ctypes.c_void_p] = []
+        if self.platform != "darwin":
+            self._security = None
+            self._darwin = None
+            return
+        self._security = _Security()
+        self._darwin = _Darwin()
+        for path in clients:
+            requirement = self._security.designated_requirement(path)
+            self._requirements.append(requirement)
+            self.requirement_strings.append(self._security.requirement_string(requirement))
+        for text in requirements:
+            requirement = self._security.requirement_from_string(text)
+            self._requirements.append(requirement)
+            self.requirement_strings.append(self._security.requirement_string(requirement))
 
     def check(self, connection: socket.socket) -> int:
-        if self._darwin is None:
+        if self._darwin is None or self._security is None:
             raise IdentityError("identity_unsupported_platform")
-        darwin = self._darwin
         try:
             cred = connection.getsockopt(SOL_LOCAL, LOCAL_PEERCRED, XUCRED_SIZE)
             pid = struct.unpack("<i", connection.getsockopt(SOL_LOCAL, LOCAL_PEERPID, 4))[0]
-            token = struct.unpack("<8I", connection.getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN, AUDIT_TOKEN_SIZE))
+            token = connection.getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN, AUDIT_TOKEN_SIZE)
+            fields = struct.unpack("<8I", token)
         except (OSError, struct.error) as exc:
             raise IdentityError("identity_unavailable") from exc
         version, uid = struct.unpack_from("<II", cred, 0)
         euid = os.geteuid()
-        if version != 0 or uid != euid or token[1] != euid:
+        if version != 0 or uid != euid or fields[1] != euid:
             raise IdentityError("caller_uid_mismatch")
-        if pid <= 1 or token[5] != pid:
+        if pid <= 1 or fields[5] != pid:
             raise IdentityError("identity_unavailable")
-        bound_version = token[7]
-
-        def same() -> None:
-            if darwin.pid_version(pid) != bound_version:
-                raise IdentityError("identity_unavailable")
-
-        same()
-        executable = os.path.realpath(darwin.path(pid))
-        client = self.clients.get(executable)
-        if client is None:
+        if not any(self._security.check_peer(token, requirement) == 0 for requirement in self._requirements):
             raise IdentityError("caller_not_owner_client")
-        try:
-            info = os.stat(client.path)
-        except OSError as exc:
-            raise IdentityError("owner_client_changed") from exc
-        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != (client.dev, client.ino, client.size, client.mtime_ns):
-            raise IdentityError("owner_client_changed")
         self._check_ancestry(pid)
-        same()
+        # 进程链读完后再校验一次签名（同一审计令牌）：期间对端退出、pid 被复用都会失败。
+        if not any(self._security.check_peer(token, requirement) == 0 for requirement in self._requirements):
+            raise IdentityError("identity_unavailable")
         return pid
 
     def _check_ancestry(self, pid: int) -> None:
@@ -224,7 +298,7 @@ class OwnerClientPolicy:
                 path = darwin.path(current)
                 parent = darwin.parent(current)
             except IdentityError:
-                break  # 祖先恰好退出：链到此为止（对端自身的生命周期另有绑定核对）
+                break  # 祖先恰好退出：链到此为止（对端自身由审计令牌绑定）
             if is_agent_process(path, darwin.argv(current)):
                 raise IdentityError("owner_client_under_agent")
             current = parent

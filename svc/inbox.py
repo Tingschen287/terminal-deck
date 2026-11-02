@@ -72,7 +72,9 @@ _BARE_CHANGE_RE = re.compile(r"(?<=[。；;！？!?）)\]】」』\"”*`])[ \t�
 _OPTION_RE = re.compile(r"^(?P<label>[A-Z])[ ．.、：:]?[ \t　]*(?P<text>\S.*)$")
 _RECOMMEND_LABEL_RE = re.compile(r"^(?P<label>[A-Z])(?:$|[ ，,。；;：:、（(])")
 _RECOMMEND_BINARY_RE = re.compile(r"^(?P<label>行|不)(?:$|[ ，,。；;：:、（(])")
-_DEFAULT_RE = re.compile(r"^(?P<day>\d{4}-\d{2}-\d{2})[ \t　]+(?P<text>\S.*)$")
+# 默认：可选的默认日 + 怎么办。没有默认日的（如对外消息「不回复就不发」）day 为 null；以像日期的东西开头但日期不合法的拒绝。
+_DEFAULT_RE = re.compile(r"^(?:(?P<day>\d{4}-\d{2}-\d{2})[ \t　]+)?(?P<text>\S.*)$")
+_DATE_LIKE_START_RE = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}")
 _ACTION_GRAPH_RE = re.compile(r"^graph[ \t]+(?P<project>[a-z0-9][a-z0-9-]{0,63})/(?P<node>[A-Za-z0-9_]{1,64})$")
 _ACTION_STAFF_RE = re.compile(r"^staff[ \t]+(?P<definition>[a-z0-9][a-z0-9_-]{0,63})$")
 
@@ -430,7 +432,9 @@ def _parse_v2(data: bytes, lines: list[Line], header: Line, title_start: int, an
         recommendation = {"label": match.group("label"), "text": ref("recommendation")}
 
     match = _DEFAULT_RE.match(value("default"))
-    if not match or not _valid_date(match.group("day")):
+    if not match or (match.group("day") and not _valid_date(match.group("day"))):
+        return "v2_default_invalid"
+    if not match.group("day") and _DATE_LIKE_START_RE.match(value("default")):
         return "v2_default_invalid"
     line, start, _ = fields["default"]
     default = {

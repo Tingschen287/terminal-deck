@@ -1,7 +1,8 @@
 """n077 写回入口的测试：身份判定（只有 owner 界面能答）、读写入口分开、socket 端到端。
 
 身份用例用真实进程与真实 socket（macOS）：
-- owner 界面程序由 testdata/owner_client_fixture.c 现编出来，登记为 --owner-client；
+- owner 界面程序由 testdata/owner_client_fixture.c 现编出来并 ad-hoc 签名（codesign -s -），登记为 --owner-client，
+  服务从它取 designated requirement（cdhash）；
 - 「owner 自己打开」= 脱离测试进程链（双 fork，父进程成为 launchd）后运行登记的程序；
 - 主管/分身 = 本测试进程（Python，未登记）直接连；或把登记的程序当子进程拉起的 `claude`。
 """
@@ -21,7 +22,7 @@ import time
 import unittest
 
 import inbox
-from inbox_writer import InboxWriter
+from inbox_answers import AnswerStore, answers_path_for
 from inbox_write_service import WriteServer
 import owner_identity
 from owner_identity import IdentityError, OwnerClientPolicy
@@ -55,17 +56,28 @@ def entry_at(parsed: dict, line: int) -> dict:
     raise AssertionError(line)
 
 
-@unittest.skipUnless(sys.platform == "darwin" and shutil.which("cc"), "需要 macOS 与 cc")
+def build_signed(source: Path, target: Path) -> None:
+    subprocess.run(["cc", "-O0", "-o", str(target), str(source)], check=True)
+    subprocess.run(["codesign", "-s", "-", "-f", str(target)], check=True, capture_output=True)
+
+
+@unittest.skipUnless(sys.platform == "darwin" and shutil.which("cc") and shutil.which("codesign"), "需要 macOS、cc 与 codesign")
 class OwnerIdentityEndToEndTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.build = tempfile.TemporaryDirectory()
         build = Path(cls.build.name)
+        source = TESTDATA / "owner_client_fixture.c"
         cls.owner_client = build / "owner-gui"
-        subprocess.run(["cc", "-O0", "-o", str(cls.owner_client), str(TESTDATA / "owner_client_fixture.c")], check=True)
-        cls.unregistered = build / "other" / "owner-gui"
-        cls.unregistered.parent.mkdir()
-        shutil.copy2(cls.owner_client, cls.unregistered)
+        build_signed(source, cls.owner_client)
+        # 「别的程序」：同一源码换一个编译常量，同样 ad-hoc 签名，文件名也相同，但代码不同、cdhash 不同
+        cls.other_signed = build / "other" / "owner-gui"
+        cls.other_signed.parent.mkdir()
+        subprocess.run(["cc", "-O0", '-DBUILD_TAG="other"', "-o", str(cls.other_signed), str(source)], check=True)
+        subprocess.run(["codesign", "-s", "-", "-f", str(cls.other_signed)], check=True, capture_output=True)
+        cls.unsigned = build / "unsigned" / "owner-gui"
+        cls.unsigned.parent.mkdir()
+        subprocess.run(["cc", "-O0", "-o", str(cls.unsigned), str(source)], check=True)
         cls.agent = build / "agentbin" / "claude"
         cls.agent.parent.mkdir()
         shutil.copy2(cls.owner_client, cls.agent)
@@ -80,10 +92,10 @@ class OwnerIdentityEndToEndTests(unittest.TestCase):
         self.inbox = self.root / "projects" / "owner-inbox.md"
         self.inbox.parent.mkdir()
         shutil.copyfile(TESTDATA / "inbox" / "structure.md", self.inbox)
-        self.state = self.root / "state"
+        self.answers = Path(answers_path_for(str(self.inbox)))
         self.socket_path = self.root / "w.sock"
         self.policy = OwnerClientPolicy([str(self.owner_client)])
-        self.server = WriteServer(str(self.socket_path), InboxWriter(str(self.inbox), str(self.state)), self.policy.check)
+        self.server = WriteServer(str(self.socket_path), AnswerStore(str(self.inbox)), self.policy.check)
         os.chmod(self.socket_path, 0o600)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         self.thread.start()
@@ -109,7 +121,7 @@ class OwnerIdentityEndToEndTests(unittest.TestCase):
             connection.sendall(json.dumps(request).encode("utf-8") + b"\n")
             return json.loads(connection.makefile("rb").readline())
 
-    def run_binary(self, argv_tail: list[str], request: dict, *, detached: bool, launcher: Path | None = None) -> dict:
+    def run_binary(self, argv_tail: list[str], request: dict, *, detached: bool, allow_no_response: bool = False) -> dict:
         self.counter += 1
         request_file = self.root / f"req-{self.counter}.json"
         out_file = self.root / f"out-{self.counter}.json"
@@ -122,6 +134,8 @@ class OwnerIdentityEndToEndTests(unittest.TestCase):
         deadline = time.time() + 10
         while not out_file.exists():
             if time.time() > deadline:
+                if allow_no_response:
+                    return {}  # 被系统拒绝运行（签名失效的程序可能被内核杀掉）也算拒绝
                 self.fail("fixture produced no response")
             time.sleep(0.02)
         return json.loads(out_file.read_bytes())
@@ -133,24 +147,51 @@ class OwnerIdentityEndToEndTests(unittest.TestCase):
         response = self.run_binary([str(self.owner_client)], self.answer_request(), detached=True)
         self.assertTrue(response["ok"], response)
         self.assertFalse(response["result"]["replayed"])
-        after = self.inbox.read_bytes()
-        self.assertEqual(entry_at(inbox.parse_inbox(after), 29)["answer"]["kind"], "yes")
-        self.assertEqual(response["result"]["sha256"], inbox.sha256_hex(after))
-        self.assertNotEqual(before, after)
+        self.assertEqual(self.inbox.read_bytes(), before)  # 收件箱不动
+        records = [json.loads(l) for l in self.answers.read_bytes().splitlines()]
+        self.assertEqual([r["type"] for r in records], ["answer"])
+        self.assertEqual(records[0]["answer"], "行")
+        self.assertTrue(self.policy.requirement_strings[0].startswith("cdhash H\""))
 
     # ---- 拒绝用例 ----
+
+    def assert_nothing_recorded(self) -> None:
+        self.assertFalse(self.answers.exists() and self.answers.read_bytes().strip())
 
     def test_supervisor_or_worker_process_is_refused(self) -> None:
         before = self.inbox.read_bytes()
         response = self.python_client(self.answer_request())
         self.assertEqual(response["error"], "caller_not_owner_client")
         self.assertEqual(self.inbox.read_bytes(), before)
+        self.assert_nothing_recorded()
 
-    def test_unregistered_copy_of_owner_client_is_refused(self) -> None:
-        before = self.inbox.read_bytes()
-        response = self.run_binary([str(self.unregistered)], self.answer_request(), detached=True)
+    def test_detached_python_client_is_refused(self) -> None:
+        """双 fork 脱离进程链的主管/分身脚本：进程链判定绕过了，代码签名照样拒。"""
+        script = self.root / "client.py"
+        script.write_text(
+            "import json, socket, sys\n"
+            "s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])\n"
+            "s.sendall(open(sys.argv[2], 'rb').read())\n"
+            "open(sys.argv[3], 'wb').write(s.makefile('rb').readline())\n",
+            encoding="utf-8",
+        )
+        response = self.run_binary([sys.executable, str(script)], self.answer_request(), detached=True)
         self.assertEqual(response["error"], "caller_not_owner_client")
-        self.assertEqual(self.inbox.read_bytes(), before)
+        self.assert_nothing_recorded()
+
+    def test_other_signed_and_unsigned_programs_are_refused(self) -> None:
+        for program in (self.other_signed, self.unsigned):
+            response = self.run_binary([str(program)], self.answer_request(), detached=True)
+            self.assertEqual(response["error"], "caller_not_owner_client", program)
+        self.assert_nothing_recorded()
+
+    def test_identical_copy_elsewhere_is_the_same_signed_code(self) -> None:
+        """签名认的是代码本身而不是路径：逐字节相同的副本放在别处，仍是同一份已登记的代码（阳性对照）。"""
+        copy = self.root / "copy" / "owner-gui"
+        copy.parent.mkdir()
+        shutil.copy2(self.owner_client, copy)
+        response = self.run_binary([str(copy)], self.answer_request(), detached=True)
+        self.assertTrue(response["ok"], response)
 
     def test_owner_client_launched_by_agent_is_refused(self) -> None:
         before = self.inbox.read_bytes()
@@ -173,17 +214,57 @@ class OwnerIdentityEndToEndTests(unittest.TestCase):
         else:
             self.assertTrue(response["ok"], response)
 
-    def test_owner_client_replaced_after_start_is_refused(self) -> None:
-        before = self.inbox.read_bytes()
+    def tampered_copy(self, name: str, *, resign: bool) -> Path:
+        """原地等长改写登记程序的一个副本（改一个字节），并把 mtime 恢复成原来的；可选再 ad-hoc 重签。"""
+        target = self.root / name / "owner-gui"
+        target.parent.mkdir()
+        shutil.copy2(self.owner_client, target)
+        info = os.stat(target)
+        data = bytearray(target.read_bytes())
+        index = data.find(b"usage")  # 改一段字符串常量，程序仍能跑
+        data[index] = ord("U")
+        with open(target, "r+b") as handle:  # 原地写，inode 不变
+            handle.write(data)
+        if resign:
+            subprocess.run(["codesign", "-s", "-", "-f", str(target)], check=True, capture_output=True)
+        os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+        after = os.stat(target)
+        self.assertEqual((after.st_size, after.st_mtime_ns), (info.st_size, info.st_mtime_ns))
+        return target
+
+    def test_registered_program_modified_in_place_is_refused(self) -> None:
+        """登记的那一份被原地等长改写并恢复 mtime（不重签 / ad-hoc 重签），双 fork 后运行：都拒。"""
         original = self.owner_client.read_bytes()
+        info = os.stat(self.owner_client)
         try:
-            self.owner_client.write_bytes(original)  # 同内容重写：inode/mtime 变了也算被换
-            os.utime(self.owner_client, ns=(time.time_ns(), time.time_ns()))
-            response = self.run_binary([str(self.owner_client)], self.answer_request(), detached=True)
-            self.assertEqual(response["error"], "owner_client_changed")
-            self.assertEqual(self.inbox.read_bytes(), before)
+            for resign in (False, True):
+                data = bytearray(original)
+                data[data.find(b"usage")] = ord("U")
+                with open(self.owner_client, "r+b") as handle:
+                    handle.write(data)
+                if resign:
+                    subprocess.run(["codesign", "-s", "-", "-f", str(self.owner_client)], check=True, capture_output=True)
+                os.utime(self.owner_client, ns=(info.st_atime_ns, info.st_mtime_ns))
+                self.assertEqual(os.stat(self.owner_client).st_ino, info.st_ino) if not resign else None
+                response = self.run_binary([str(self.owner_client)], self.answer_request(), detached=True,
+                                           allow_no_response=True)
+                self.assertNotEqual(response.get("ok"), True, resign)
+                if response:
+                    self.assertEqual(response["error"], "caller_not_owner_client", resign)
+                self.assert_nothing_recorded()
         finally:
-            self.owner_client.write_bytes(original)
+            with open(self.owner_client, "wb") as handle:
+                handle.write(original)
+            os.utime(self.owner_client, ns=(info.st_atime_ns, info.st_mtime_ns))
+
+    def test_tampered_copies_are_refused(self) -> None:
+        for name, resign in (("tampered", False), ("resigned", True)):
+            program = self.tampered_copy(name, resign=resign)
+            response = self.run_binary([str(program)], self.answer_request(), detached=True, allow_no_response=True)
+            self.assertNotEqual(response.get("ok"), True, name)
+            if response:
+                self.assertEqual(response["error"], "caller_not_owner_client", name)
+        self.assert_nothing_recorded()
 
     def test_refusal_does_not_echo_request(self) -> None:
         request = self.answer_request(kind="change", text="B 夹具 ZQX 机密文字")
@@ -195,14 +276,16 @@ class OwnerIdentityEndToEndTests(unittest.TestCase):
         response = self.run_binary([str(self.owner_client)], {"op": "inbox"}, detached=True)
         self.assertEqual(response["error"], "unsupported_operation")
 
-    def test_inbox_changed_reports_current_hash_only(self) -> None:
+    def test_stale_entry_reports_current_hash_only(self) -> None:
         request = self.answer_request()
-        changed = self.inbox.read_bytes() + "- 2026-01-09 · 主管甲 · 夹具 ZQX 期间写入。\n".encode("utf-8")
+        data = self.inbox.read_bytes()
+        changed = data.replace("夹具 ZQX 三选一".encode(), "夹具 ZQX 主管改过的三选一".encode())
         self.inbox.write_bytes(changed)
         response = self.run_binary([str(self.owner_client)], request, detached=True)
-        self.assertEqual(response["error"], "inbox_changed")
+        self.assertEqual(response["error"], "entry_not_found")
         self.assertEqual(response["current_sha256"], inbox.sha256_hex(changed))
         self.assertEqual(self.inbox.read_bytes(), changed)
+        self.assert_nothing_recorded()
 
 
 class PolicyUnitTests(unittest.TestCase):
@@ -234,12 +317,18 @@ class PolicyUnitTests(unittest.TestCase):
             OwnerClientPolicy([])
         with self.assertRaises(IdentityError):
             OwnerClientPolicy(["relative/path"])
-        with tempfile.TemporaryDirectory() as folder:
-            writable = Path(folder) / "gui"
-            writable.write_bytes(b"#!/bin/sh\n")
-            os.chmod(writable, 0o777)
+        if sys.platform == "darwin":
+            with tempfile.TemporaryDirectory() as folder:
+                unsigned = Path(folder) / "gui"
+                unsigned.write_bytes(b"#!/bin/sh\n")
+                os.chmod(unsigned, 0o755)
+                with self.assertRaises(IdentityError) as raised:
+                    OwnerClientPolicy([str(unsigned)])  # 没签名不能登记
+                self.assertEqual(raised.exception.code, "owner_client_invalid")
             with self.assertRaises(IdentityError):
-                OwnerClientPolicy([str(writable)])
+                OwnerClientPolicy(requirements=["this is not a requirement"])
+            self.assertEqual(OwnerClientPolicy(requirements=['identifier "com.apple.sh" and anchor apple'])
+                             .requirement_strings, ['identifier "com.apple.sh" and anchor apple'])
 
     @unittest.skipUnless(sys.platform == "darwin", "需要 macOS")
     def test_python_peer_is_not_owner_client(self) -> None:
@@ -307,6 +396,24 @@ class ReadWriteSeparationTests(unittest.TestCase):
         self.assertEqual(warnings[6], ["title_bare_node_id"])
         self.assertEqual(response["result"]["counts"]["pending"]["warned"], 4)
         self.assertNotIn(CANARY, json.dumps(response, ensure_ascii=False))
+
+    def test_read_service_overlays_unmerged_answers(self) -> None:
+        data = self.inbox.read_bytes()
+        entry = entry_at(inbox.parse_inbox(data), 11)
+        AnswerStore(str(self.inbox)).answer(request_id="req-read-0001", expected_sha256=inbox.sha256_hex(data),
+                                            line_start=11, entry_sha256=entry["sha256"], kind="change",
+                                            text="B，夹具 ZQX 理由")
+        answers_before = Path(answers_path_for(str(self.inbox))).read_bytes()
+        response = self.request({"op": "inbox"})
+        self.assertTrue(response["ok"])
+        overlaid = next(e for e in response["result"]["pending"] if e["line_start"] == 11)
+        self.assertEqual(overlaid["owner_answer"]["request_id"], "req-read-0001")
+        self.assertEqual(overlaid["owner_answer"]["status"], "pending_merge")
+        self.assertFalse(overlaid["answerable"])
+        self.assertEqual(response["result"]["answers"]["counts"]["pending_merge"], 1)
+        self.assertNotIn(CANARY, json.dumps(response, ensure_ascii=False))
+        self.assertEqual(self.inbox.read_bytes(), data)
+        self.assertEqual(Path(answers_path_for(str(self.inbox))).read_bytes(), answers_before)
 
     def test_read_service_cannot_write(self) -> None:
         before = self.inbox.read_bytes()

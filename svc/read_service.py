@@ -22,9 +22,8 @@ import sys
 import threading
 from typing import Any
 
-import inbox as inbox_parser
 from inbox import InboxError
-from inbox_io import read_snapshot
+from inbox_answers import inbox_view
 
 
 MAX_REQUEST_BYTES = 64 * 1024
@@ -55,6 +54,9 @@ SERVICE_ERROR_MESSAGES = {
     "inbox_unreadable": "inbox could not be read",
     "inbox_too_large": "inbox is too large",
     "inbox_invalid_encoding": "inbox is not valid UTF-8",
+    "answers_unsafe": "answers file is not a single regular file",
+    "answers_unreadable": "answers file could not be read",
+    "answers_too_large": "answers file is too large",
 }
 # projectctl 读取命令的固定错误码（见 projectctl READ_ERROR_MESSAGES）；svc 只转发错误码。
 PROJECTCTL_READ_ERROR_CODES = frozenset(
@@ -262,25 +264,19 @@ class ReadServer(socketserver.ThreadingUnixStreamServer):
         return self.client.call(request)
 
     def read_inbox(self) -> dict[str, Any]:
-        """收件箱的结构化结果：待你定、已定、信任档位表。只读、不写盘，人写文本只给字节范围与 sha256。
+        """收件箱的结构化结果：待你定、已定、信任档位表，叠加答复文件里未合并的答复。
+        只读、不写盘，人写文本只给字节范围与 sha256，答复只给 request_id 与 sha256。
 
         写回答复不在本服务：见 inbox_write_service.py（另一个进程、另一个 socket，只给 owner 界面）。
         """
         if not self.inbox_path:
             raise ReadServiceError("inbox_not_configured")
         try:
-            snapshot = read_snapshot(self.inbox_path)
-            result = inbox_parser.parse_inbox(snapshot.data)
+            result = inbox_view(self.inbox_path)
         except InboxError as exc:
             code = exc.code if exc.code in SERVICE_ERROR_MESSAGES else "internal_error"
             log_code(code)
             raise ReadServiceError(code) from exc
-        result["file"] = {
-            "path": self.inbox_path,
-            "sha256": snapshot.sha256,
-            "size": snapshot.size,
-            "mtime_ns": snapshot.mtime_ns,
-        }
         return {"ok": True, "result": result}
 
 
