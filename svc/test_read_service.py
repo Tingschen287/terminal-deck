@@ -17,12 +17,13 @@ import read_service
 from read_service import ProjectCtlClient, ReadServer, ReadServiceError
 
 
+# attempt 7 曾有的调试开关名；attempt 8 起已删除，设置它也不得改变 stderr。
 READ_DEBUG_ENV = "PROJECTCTL_READ_DEBUG"
 
 
 class ReadServiceTests(unittest.TestCase):
     def setUp(self) -> None:
-        # 默认关闭调试开关；个别测试显式打开。
+        # 先去掉旧调试开关；个别测试显式设置它，验证仍然零命中。
         previous_debug = os.environ.pop(READ_DEBUG_ENV, None)
         if previous_debug is not None:
             self.addCleanup(os.environ.__setitem__, READ_DEBUG_ENV, previous_debug)
@@ -172,7 +173,7 @@ print(json.dumps({'ok': True, 'result': {'argv': sys.argv[1:]}}))
                 raise RuntimeError(marker)
             except RuntimeError:
                 self.server.handle_error(None, None)
-            read_service.log_detail(marker, marker)
+            read_service.log_code(marker)
         for response in responses:
             self.assertFalse(response["ok"])
             self.assertNotIn(marker, json.dumps(response))
@@ -186,17 +187,29 @@ print(json.dumps({'ok': True, 'result': {'argv': sys.argv[1:]}}))
         self.assertIn("read service error: node_not_found", lines)
         self.assertIn("read service error: projectctl_invalid_response", lines)
 
-    def test_service_debug_detail_only_with_explicit_switch(self) -> None:
-        """变异对照：显式打开调试开关后，同一组请求才在 stderr 出现原始细节。"""
+    def test_service_stderr_stays_fixed_codes_with_old_debug_switch_set(self) -> None:
+        """R15（attempt 8）：设置旧调试开关 PROJECTCTL_READ_DEBUG=1 后，同一组请求的服务
+        stderr 仍零命中、每行都是固定码；服务不收集 projectctl 的 stderr。"""
         marker = "SYNTH_SECRET_9f3a"
         os.environ[READ_DEBUG_ENV] = "1"
         self.addCleanup(os.environ.pop, READ_DEBUG_ENV, None)
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             responses = self._error_requests_with_marker(marker)
+            try:
+                raise RuntimeError(marker)
+            except RuntimeError:
+                self.server.handle_error(None, None)
         for response in responses:
             self.assertNotIn(marker, json.dumps(response))
-        self.assertIn(marker, stderr.getvalue())
+        captured = stderr.getvalue()
+        self.assertNotIn(marker, captured)
+        self.assertNotIn("/synthetic", captured)
+        for line in captured.splitlines():
+            self.assertRegex(line, r"^read service error: [a-z_]+$")
+        source = Path(read_service.__file__).read_text(encoding="utf-8")
+        self.assertNotIn(READ_DEBUG_ENV, source)
+        self.assertNotIn("subprocess.PIPE if", source)
 
     def test_invalid_limits_and_cursor_combination_are_rejected(self) -> None:
         requests = [

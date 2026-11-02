@@ -30,9 +30,8 @@ LISTEN_BACKLOG = 64
 
 # 所有错误响应都是 {"ok": false, "error": <固定错误码>, "message": <固定说明>}，
 # 不拼入任何请求内容、projectctl 输出或异常文本。服务 stderr 同样只写固定错误码：
-# 默认不转写 projectctl 的 stderr、不写异常文本；只有显式设置 PROJECTCTL_READ_DEBUG=1
-# 时才把原始细节写到本机 stderr 供调试（attempt 7，R15）。
-READ_DEBUG_ENV = "PROJECTCTL_READ_DEBUG"
+# 任何运行模式下都不收集、不转写 projectctl 的 stderr，不写异常文本，没有调试开关
+# （attempt 8，R15）。
 SERVICE_ERROR_MESSAGES = {
     "request_invalid": "request must be one JSON object line of at most 65536 bytes",
     "request_timeout": "request read timed out",
@@ -70,18 +69,11 @@ class ReadServiceError(RuntimeError):
         return {"ok": False, "error": self.code, "message": self.message}
 
 
-def read_debug_enabled() -> bool:
-    return os.environ.get(READ_DEBUG_ENV) == "1"
-
-
-def log_detail(code: str, detail: object) -> None:
-    """服务 stderr：默认只有固定错误码；调试开关打开时才附原始细节。"""
+def log_code(code: str) -> None:
+    """服务 stderr 的唯一出口：只写固定错误码，不接受任何细节参数。"""
     if code not in SERVICE_ERROR_MESSAGES and code not in PROJECTCTL_READ_ERROR_CODES:
         code = "internal_error"
-    if read_debug_enabled():
-        print(f"read service debug ({code}): {detail}", file=sys.stderr)
-    else:
-        print(f"read service error: {code}", file=sys.stderr)
+    print(f"read service error: {code}", file=sys.stderr)
 
 
 class ProjectCtlClient:
@@ -140,24 +132,22 @@ class ProjectCtlClient:
                 arguments,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                # 默认丢弃 projectctl 的 stderr，不转写；调试开关打开时才收集。
-                stderr=subprocess.PIPE if read_debug_enabled() else subprocess.DEVNULL,
+                # projectctl 的 stderr 一律丢弃，不收集、不转写。
+                stderr=subprocess.DEVNULL,
                 text=True,
                 timeout=self.timeout,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            log_detail("projectctl_timeout", exc)
+            log_code("projectctl_timeout")
             raise ReadServiceError("projectctl_timeout") from exc
         except OSError as exc:
-            log_detail("projectctl_unavailable", exc)
+            log_code("projectctl_unavailable")
             raise ReadServiceError("projectctl_unavailable") from exc
-        if completed.stderr and read_debug_enabled():
-            log_detail("projectctl_failed", completed.stderr.strip())
         try:
             response = json.loads(completed.stdout)
         except json.JSONDecodeError as exc:
-            log_detail("projectctl_invalid_response", exc)
+            log_code("projectctl_invalid_response")
             raise ReadServiceError("projectctl_invalid_response") from exc
         if not isinstance(response, dict) or "ok" not in response:
             raise ReadServiceError("projectctl_invalid_response")
@@ -166,7 +156,7 @@ class ProjectCtlClient:
             match = ERROR_CODE_PREFIX_RE.match(error) if isinstance(error, str) else None
             code = match.group(1) if match else ""
             code = code if code in PROJECTCTL_READ_ERROR_CODES else "projectctl_failed"
-            log_detail(code, "projectctl read returned an error")
+            log_code(code)
             raise ReadServiceError(code)
         return response
 
@@ -193,7 +183,7 @@ class ReadRequestHandler(socketserver.StreamRequestHandler):
         except ReadServiceError as exc:
             response = exc.response()
         except Exception as exc:
-            log_detail("internal_error", repr(exc))
+            log_code("internal_error")
             response = ReadServiceError("internal_error").response()
         try:
             self.wfile.write(
@@ -248,7 +238,7 @@ class ReadServer(socketserver.ThreadingUnixStreamServer):
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         # socketserver 默认把完整 traceback 打到 stderr；这里只写固定错误码。
-        log_detail("internal_error", repr(sys.exc_info()[1]))
+        log_code("internal_error")
 
     def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         if request.get("op") == "health":
@@ -317,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except (OSError, json.JSONDecodeError) as exc:
         # OSError 文本含路径等运行时值：默认只写固定码。
-        log_detail("internal_error", repr(exc))
+        log_code("internal_error")
         print("ERROR: internal_error: " + SERVICE_ERROR_MESSAGES["internal_error"], file=sys.stderr)
         return 1
 
