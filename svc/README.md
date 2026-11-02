@@ -51,11 +51,13 @@ python3.12 svc/read_service.py health --socket /tmp/anpai-read-$UID.sock
 `graph` 与 `event_cursor` 元数据。读不到的数据源不会伪装为空结果。
 
 错误响应固定为 `{"ok":false,"error":"<错误码>","message":"<固定说明>"}`，不含任何请求内容、
-projectctl 输出或异常文本；原始细节只写服务本机 stderr。服务自身的错误码：`request_invalid`、
+projectctl 输出或异常文本。服务的 stderr 同样只写固定错误码（每行 `read service error: <错误码>`），
+不转写 projectctl 的 stderr（默认直接丢弃）、不写异常文本或请求内容；需要调试时显式设置
+`PROJECTCTL_READ_DEBUG=1` 启动服务，原始细节才写到本机 stderr，默认关闭。服务自身的错误码：`request_invalid`、
 `request_timeout`、`capacity_reached`、`unsupported_operation`、`argument_invalid`、
 `projectctl_unavailable`、`projectctl_timeout`、`projectctl_invalid_response`、
 `projectctl_failed`、`internal_error`；projectctl 的读取错误码（`node_not_found`、
-`path_outside_project`、`history_invalid` 等）原样转发错误码，未知的一律 `projectctl_failed`。
+`path_outside_project`、`project_root_unsafe`、`history_invalid` 等）原样转发错误码，未知的一律 `projectctl_failed`。
 
 每个连接的请求读取超时为 5 秒，最多同时处理 16 个连接，监听队列容量为 64。
 容量占满时新连接收到 `capacity_reached` 错误；慢连接超时后
