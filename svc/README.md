@@ -78,6 +78,8 @@ projectctl 输出或异常文本。服务的 stderr 同样只写固定错误码�
 `{field, chars, bytes, sha256, byte_start, byte_end}`，GUI 用 `result.file.path` 在本机打开文件、核对
 `result.file.sha256` 后按字节切片。传出的只有日期、枚举（档位 L0–L3、答复 yes/no/change、动作 none/graph/staff/text）、
 选项字母、Graph 标识、行号与偏移。解析不了的条目 `status: unparsed`，带原因码与字节范围，不丢、不猜。
+条目的 `warnings` 是格式警告码：`title_bare_node_id` 表示标题里有裸节点 id（应写 `[项目简称·节点简称 编号]`），
+只提示，不影响解析与写回。
 文件路径只来自启动参数，请求里给的路径一律忽略。
 
 ```bash
