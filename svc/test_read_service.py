@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -11,11 +13,19 @@ import threading
 import time
 import unittest
 
+import read_service
 from read_service import ProjectCtlClient, ReadServer, ReadServiceError
+
+
+READ_DEBUG_ENV = "PROJECTCTL_READ_DEBUG"
 
 
 class ReadServiceTests(unittest.TestCase):
     def setUp(self) -> None:
+        # 默认关闭调试开关；个别测试显式打开。
+        previous_debug = os.environ.pop(READ_DEBUG_ENV, None)
+        if previous_debug is not None:
+            self.addCleanup(os.environ.__setitem__, READ_DEBUG_ENV, previous_debug)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.log = self.root / "calls.jsonl"
@@ -34,6 +44,10 @@ if 'read-file' in sys.argv and 'bad' in sys.argv:
 if 'read-file' in sys.argv and 'coded' in sys.argv:
     print('raw detail SYNTH_SECRET_9f3a', file=sys.stderr)
     print(json.dumps({'ok': False, 'error': 'node_not_found: leaked SYNTH_SECRET_9f3a'}))
+    raise SystemExit(1)
+if 'read-file' in sys.argv and 'garbled' in sys.argv:
+    print('raw detail SYNTH_SECRET_9f3a', file=sys.stderr)
+    print('not json SYNTH_SECRET_9f3a')
     raise SystemExit(1)
 if 'read-file' in sys.argv and 'uncoded' in sys.argv:
     print(json.dumps({'ok': False, 'error': 'SYNTH_SECRET_9f3a: not a code we know'}))
@@ -129,6 +143,60 @@ print(json.dumps({'ok': True, 'result': {'argv': sys.argv[1:]}}))
             self.assertFalse(response["ok"])
             self.assertEqual(set(response), {"ok", "error", "message"})
             self.assertNotIn(marker, json.dumps(response))
+
+    def _error_requests_with_marker(self, marker: str) -> list[dict]:
+        responses = []
+        for path in ("coded", "uncoded", "garbled", "bad"):
+            responses.append(self.request({"op": "file", "project": "/synthetic/" + marker, "path": path}))
+        for request in (
+            {"op": marker, "project": marker},
+            {"op": "node", "project": marker, "node_id": 7},
+            {"op": "events", "project": marker, "limit": marker},
+        ):
+            responses.append(self.request(request))
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(5)
+            connection.connect(str(self.socket_path))
+            connection.sendall(b"{not json " + marker.encode() + b"\n")
+            responses.append(json.loads(connection.makefile("rb").readline()))
+        return responses
+
+    def test_service_stderr_carries_only_fixed_codes_by_default(self) -> None:
+        """R15：服务 stderr 默认只写固定错误码，不转写 projectctl stderr、异常文本或请求内容。"""
+        marker = "SYNTH_SECRET_9f3a"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            responses = self._error_requests_with_marker(marker)
+            # 处理线程里逃出 handle() 的异常（socketserver.handle_error）也只写固定码。
+            try:
+                raise RuntimeError(marker)
+            except RuntimeError:
+                self.server.handle_error(None, None)
+            read_service.log_detail(marker, marker)
+        for response in responses:
+            self.assertFalse(response["ok"])
+            self.assertNotIn(marker, json.dumps(response))
+        captured = stderr.getvalue()
+        self.assertNotIn(marker, captured)
+        self.assertNotIn("/synthetic", captured)
+        lines = captured.splitlines()
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertRegex(line, r"^read service error: [a-z_]+$")
+        self.assertIn("read service error: node_not_found", lines)
+        self.assertIn("read service error: projectctl_invalid_response", lines)
+
+    def test_service_debug_detail_only_with_explicit_switch(self) -> None:
+        """变异对照：显式打开调试开关后，同一组请求才在 stderr 出现原始细节。"""
+        marker = "SYNTH_SECRET_9f3a"
+        os.environ[READ_DEBUG_ENV] = "1"
+        self.addCleanup(os.environ.pop, READ_DEBUG_ENV, None)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            responses = self._error_requests_with_marker(marker)
+        for response in responses:
+            self.assertNotIn(marker, json.dumps(response))
+        self.assertIn(marker, stderr.getvalue())
 
     def test_invalid_limits_and_cursor_combination_are_rejected(self) -> None:
         requests = [
